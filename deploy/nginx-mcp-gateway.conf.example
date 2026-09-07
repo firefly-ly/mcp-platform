@@ -1,0 +1,92 @@
+# ============================================================================
+# MCP 平台网关模板（生产部署用）
+# 作用：用户只能从这里进 —— 网关验登录态、注入身份 header、带 X-Gateway-Token
+#       转发给后端 4000；后端 TRUST_GATEWAY=1 时没有该 token 的直连一律 403。
+#
+# 配套后端启动参数：
+#   TRUST_GATEWAY=1
+#   GATEWAY_TOKEN=<openssl rand -hex 32 生成的值>
+#   PUBLIC_BASE=https://mcp.你的域名        # 用户复制的配置地址走这个域名
+#   INTERNAL_PROXY_TOKEN=<另一个强随机值>    # Next 服务端回源用
+#
+# 用户/前端访问链路：
+#   浏览器/MCP 客户端 → https://域名(443, 本文件) → http://127.0.0.1:4000
+#   4000 不再对用户开放（防火墙/安全组只允许本机访问 4000）
+#
+# 登录校验：auth_request 子请求打到 Next 的会话检查端点（200=放行, 401=拦截）。
+# 注：<NEXT_INTERNAL> 为 Next 服务端仅监听内网/本机的地址与端口。
+# ============================================================================
+
+# 强随机网关令牌（与后端 GATEWAY_TOKEN 一致），可用变量或直接写死在受保护的配置里
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 443 ssl;
+    server_name mcp.你的域名;
+
+    # ssl_certificate     /etc/nginx/certs/fullchain.pem;
+    # ssl_certificate_key /etc/nginx/certs/privkey.pem;
+
+    # ------------------------------------------------------------------
+    # 所有 /api/（平台后端 API）与 /mcp-proxy/（MCP 调用）统一走：
+    #   1) auth_request 验登录态（MCP 客户端如无法带 cookie，可用
+    #      X-API-Key 头替代——按企业身份设施调整这一段）
+    #   2) 注入 x-actor-* 身份 header（来源：JWT claims 或企业目录查询）
+    #   3) 注入 X-Gateway-Token（后端 TRUST_GATEWAY=1 的门票）
+    # ------------------------------------------------------------------
+    set $gateway_token "CHANGE_ME_openssl_rand_hex_32";
+
+    location /mcp-proxy/ {
+        # MCP 客户端（WorkBuddy 等）不是浏览器，无法走 session —— 用 API Key：
+        # 客户端配置 URL 已含 ?t=<mcp_token>，这里校验其存在后注入网关 token。
+        # 更严格的身份绑定（用户级 API Key ↔ 可见性）由后端 restricted 校验完成。
+        proxy_pass http://127.0.0.1:4000;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Gateway-Token $gateway_token;
+        # SSE/长连接：关缓冲、拉长超时
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
+    location /api/ {
+        # 浏览器 API：先验登录态（Next session）
+        auth_request /_auth_verify;
+        error_page 401 = @to_login;
+
+        proxy_pass http://127.0.0.1:4000;
+        proxy_set_header Host $host;
+        # 身份注入：从已验证的 JWT/session 取值（示例用 auth_request 传回的头）
+        proxy_set_header x-actor-email  $upstream_http_x_actor_email;
+        proxy_set_header x-actor-groups $upstream_http_x_actor_groups;
+        proxy_set_header x-actor-admin  $upstream_http_x_actor_admin;
+        proxy_set_header X-Gateway-Token $gateway_token;
+        # 安全底线：剥掉客户端自带的身份 header，杜绝伪造
+        proxy_set_header x-internal-proxy "";
+    }
+
+    # 登录校验子请求：打 Next 的会话检查端点（需在 Next 侧提供，200/401）
+    location = /_auth_verify {
+        internal;
+        proxy_pass <NEXT_INTERNAL>/api/auth/verify;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_set_header Cookie $http_cookie;
+    }
+
+    location @to_login {
+        return 302 /signin;
+    }
+
+    # Next 前端本身
+    location / {
+        proxy_pass http://<NEXT_INTERNAL>;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+    }
+}
