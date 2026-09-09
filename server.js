@@ -19,7 +19,22 @@ const http = require("http");
 const zlib = require("zlib");
 const objStore = require("./object-store");
 
+// 内置 .env 加载（不依赖 dotenv）：仅填充未设置的环境变量，已导出的优先
+(() => {
+  const fs = require("fs"), p = path.join(__dirname, ".env");
+  if (!fs.existsSync(p)) return;
+  for (const line of fs.readFileSync(p, "utf8").split(/\r?\n/)) {
+    const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
+    if (!m) continue;
+    const val = m[2].replace(/^["']|["']$/g, "");
+    if (!(m[1] in process.env)) process.env[m[1]] = val;
+  }
+})();
+
 const PORT = process.env.PORT || 4000;
+// 默认只绑本机回环：身份靠前端转发的 x-actor-email 头，直连暴露 0.0.0.0 可被局域网伪造。
+// 需要对外（如网关/TRUST_GATEWAY 部署）时显式设 HOST=0.0.0.0。
+const HOST = process.env.HOST || "127.0.0.1";
 // 重要：WSL2 下 /mnt/c 是 DrvFS(9p)，SQLite 的 fsync/文件锁支持不全，
 // 会导致进程卡在 D 态、端口绑不上。故 Linux 下默认把 DB 放到原生文件系统。
 const DB_PATH = process.env.DB_PATH ||
@@ -219,11 +234,11 @@ async function getIngressPort(workloadName) {
 // 背景：ToolHive 部署时 thv list 先报告内部端口（如 127.0.0.1:21784），此时 ingress
 // 容器尚未创建，导致写入 meta.endpoint 的端口浏览器无法访问。详情/调用时重新查一次。
 // ensureStableIngress 幂等：固定端口可用时秒回；坏/缺 ingress 时重建（端口不变）。
-async function discoverIngressForSubmission(sub) {
+async function discoverIngressForSubmission(sub, opts = {}) {
   if (!sub || sub.type !== "mcp") return null;
   const meta = parseMeta(sub);
   const workload = meta.workload_name || workloadNameFor(sub.id);
-  const p = await ensureStableIngress(workload, meta);
+  const p = await ensureStableIngress(workload, meta, opts);
   if (p) return `http://127.0.0.1:${p}/mcp`;
   return meta.endpoint || null;
 }
@@ -296,10 +311,11 @@ async function parseSSE(body) {
   return events;
 }
 
-async function mcpPost(endpoint, sessionId, body) {
+async function mcpPost(endpoint, sessionId, body, extraHeaders) {
   const headers = {
     "Content-Type": "application/json",
     Accept: "application/json, text/event-stream",
+    ...(extraHeaders || {}),
   };
   if (sessionId) headers["Mcp-Session-Id"] = sessionId;
   const resp = await fetch(endpoint, {
@@ -319,7 +335,7 @@ async function mcpPost(endpoint, sessionId, body) {
 }
 
 // 真实 MCP 调用：initialize -> initialized -> (tools/list | tools/call)
-async function mcpCall(endpoint, { tool, args } = {}) {
+async function mcpCall(endpoint, { tool, args, headers } = {}) {
   const init = await mcpPost(endpoint, null, {
     jsonrpc: "2.0", id: 1, method: "initialize",
     params: {
@@ -327,20 +343,45 @@ async function mcpCall(endpoint, { tool, args } = {}) {
       capabilities: {},
       clientInfo: { name: "platform-backend", version: "1.0" },
     },
-  });
+  }, headers);
   const payload = init.events[init.events.length - 1] || {};
   if (payload.error) throw new Error("initialize 失败: " + JSON.stringify(payload.error));
   const sid = init.sid;
-  await mcpPost(endpoint, sid, { jsonrpc: "2.0", method: "notifications/initialized" });
+  await mcpPost(endpoint, sid, { jsonrpc: "2.0", method: "notifications/initialized" }, headers);
   if (!tool) {
-    const r = await mcpPost(endpoint, sid, { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+    const r = await mcpPost(endpoint, sid, { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }, headers);
     return { stage: "tools/list", events: r.events, status: r.status };
   }
   const r = await mcpPost(endpoint, sid, {
     jsonrpc: "2.0", id: 3, method: "tools/call",
     params: { name: tool, arguments: args || {} },
-  });
+  }, headers);
   return { stage: "tools/call", events: r.events, status: r.status };
+}
+
+// 带鉴权候选的 MCP 调用：条目 env 里配了 API Key/Token 时逐个尝试（按优先级），
+// 全部 401/403 才回落到无鉴权（与旧行为一致）。应用未做鉴权时带凭证调用也无害
+// （大多数实现忽略多余头），所以凭证候选放在前面，减少一轮往返。
+async function mcpCallAuthed(endpoint, opts, meta) {
+  const candidates = [{}, ...authHeaderCandidates(meta || {})];
+  let last;
+  for (let i = 0; i < candidates.length; i++) {
+    try {
+      const r = await mcpCall(endpoint, { ...opts, headers: candidates[i] });
+      const denied = r.status === 401 || r.status === 403;
+      if (denied && i < candidates.length - 1) { last = r; continue; }
+      return r;
+    } catch (e) {
+      last = e;
+      const denied = r401403(e);
+      if (denied && i < candidates.length - 1) continue;
+      throw e;
+    }
+  }
+  return last;
+}
+function r401403(e) {
+  return /\b40[13]\b|unauthorized|forbidden/i.test(String((e && e.message) || e));
 }
 
 // ---- P3: 审批后通过 ToolHive 自动部署 MCP，并回写运行端点 ----
@@ -490,32 +531,16 @@ function ensureGroupMeta(sub) {
   return gv;
 }
 
-// 读取某 group 当前激活的版本 submission_id
-function getActiveSubmissionId(group_key) {
-  const row = db.prepare("SELECT active_submission_id FROM active_versions WHERE group_key=?").get(group_key);
-  return row ? row.active_submission_id : null;
-}
+// （原 getActiveSubmissionId / setActiveSubmission 已随激活指针废弃移除；
+//  active_versions 表保留以兼容历史库结构，不再读写。）
 
-// 设置激活版本
-function setActiveSubmission(group_key, item_type, submission_id) {
-  db.prepare(
-    "INSERT INTO active_versions(group_key, item_type, active_submission_id, updated_at) VALUES(?,?,?,?) " +
-    "ON CONFLICT(group_key) DO UPDATE SET active_submission_id=excluded.active_submission_id, updated_at=excluded.updated_at"
-  ).run(group_key, item_type, submission_id, new Date().toISOString());
-}
-
-// 多版本折叠：每个 group 只展示一条（激活版本优先，否则该 group 内最新一条）。
+// 多版本折叠：每个 group 只展示一条——**最新已上架版本优先**，组内无已上架时回落最新一条。
+// （2026-09-08 起废弃 active_versions 指针：用户侧版本下拉已实现自选已上架版本，
+//  指针只剩"默认选中项"一个作用，改由"最新已上架"这一确定性规则承担，不再维护指针表。）
 //
-// ⚠️ 这里踩过一个"审批一个就只剩一个"的坑：原实现是
-//      activeSet.size ? rows.filter(s => activeSet.has(s.id)) : Object.values(latestByGroup)
-//    ——全局 all-or-nothing。只要**任意**一个 group 写过 active_versions 记录，
-//    就对**所有** group 启用严格过滤，于是历史/种子数据（没有 group_key、
-//    也从未写入 active_versions）会被整批过滤掉，页面上只剩刚审批的那一条。
-//    正确粒度是"按 group 各自决策"，兜底必须落在 group 内部而不是全局。
-function pickDisplayVersions(rows, activeRows) {
-  const activeIdByGroup = new Map(
-    (activeRows || []).map((a) => [a.group_key, a.active_submission_id]),
-  );
+// ⚠️ 历史坑（保留警示）：粒度必须"按 group 各自决策"，兜底落在 group 内部而不是全局——
+//    曾因全局 all-or-nothing 过滤导致"审批一个就只剩一个"。
+function pickDisplayVersions(rows) {
   const byGroup = new Map();
   rows.forEach((s) => {
     // 无 group_key 的历史数据以自身 id 为 group，保证各自独立成组、不会互相顶掉
@@ -523,14 +548,13 @@ function pickDisplayVersions(rows, activeRows) {
     if (!byGroup.has(gk)) byGroup.set(gk, []);
     byGroup.get(gk).push(s);
   });
+  const byNewest = (a, b) => (a.created_at >= b.created_at ? a : b);
   const picked = [];
-  byGroup.forEach((list, gk) => {
-    const activeId = activeIdByGroup.get(gk);
-    // 激活记录可能指向已被 deprecated/removed 的版本（不在 rows 里）→ 回落该组最新
-    const hit = activeId ? list.find((s) => s.id === activeId) : null;
-    picked.push(
-      hit || list.reduce((a, b) => (a.created_at >= b.created_at ? a : b)),
-    );
+  byGroup.forEach((list) => {
+    // 最新创建的按序找第一个已上架的；整组都未上架则回落组内最新（用户页后续还有可见性过滤）
+    const hit = [...list].sort((a, b) => (a.created_at < b.created_at ? 1 : -1))
+      .find((s) => isOnShelf(parseMeta(s)));
+    picked.push(hit || list.reduce(byNewest));
   });
   return picked.sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
 }
@@ -596,11 +620,18 @@ const {
   buildZip, convertArtifactToZip, inspectSkillPackage,
   parseYamlFrontMatter, validateSkillPackage,
 } = require("./lib/pkg")(CTX);
+// pkg 函数必须挂回 CTX：scan/source-build 等后初始化的模块从 ctx 解构这些函数，
+// 不挂载则拿到 undefined（2026-09-07 trivy 源码包扫描报 openSkillPackage is not a function 即此因）。
+Object.assign(CTX, {
+  tarListFile, tarExtractFile, openSkillPackage, isPathTraversal,
+  buildZip, convertArtifactToZip, inspectSkillPackage,
+  parseYamlFrontMatter, validateSkillPackage,
+});
 const { audit, deniedThrottled } = require("./lib/audit")(CTX);
 CTX.audit = audit;
 const {
   parseDotenv, scanSourceEnvKeys, thvSecretSet, thvSecretDelete, secretNameFor,
-  storeSubmissionEnv, deleteSubmissionSecrets, envInjectArgs,
+  storeSubmissionEnv, deleteSubmissionSecrets, envInjectArgs, authHeaderCandidates,
 } = require("./lib/env-secrets")(CTX);
 const { buildSourceImage, SOURCE_MAX_MB } = require("./lib/source-build")(CTX);
 const {
@@ -665,9 +696,10 @@ async function deployMcp(id) {
       try {
         sourceBuiltImage = await buildSourceImage(sub);
       } catch (e) {
+        // 保留消息尾部：docker/pip 的真实报错在构建日志末尾，头部只是无害进度
         patchMeta(id, {
           deploy_status: "failed",
-          deploy_error: "源码构建失败: " + String((e && e.message) || e).slice(0, 500),
+          deploy_error: "源码构建失败: " + String((e && e.message) || e).slice(-700),
         });
         return;
       }
@@ -722,11 +754,22 @@ async function deployMcp(id) {
       await execFileHidden(THV_BIN, ["rm", workload], { timeout: 30000, maxBuffer: MAX_BUFFER });
     } catch (_) { /* 不存在，忽略 */ }
     const args = ["run", "--name", workload, image];
-    // 源码构建的 MCP：约定为「自起 HTTP 服务、容器内监听 3000」（Dockerfile 模板固定
-    // EXPOSE 3000），必须显式 sse 代理模式 + target-port，否则 thv 按 stdio 包裹会
-    // 出现 "upstream connect failed"（HTTP 服务无法走 stdio 协议）。
+    // 源码构建的 MCP：自起 HTTP 服务，必须显式 sse 代理模式，否则 thv 按 stdio
+    // 包裹会出现 "upstream connect failed"。目标端口不写死 3000——自带 Dockerfile
+    // 的工程监听端口由作者决定（曾见 8765，写死 3000 会让代理 502）：
+    // 优先读镜像 EXPOSE，EXPOSE 3000 或读不到时回退约定值 3000。
     if (meta.source_type === "source") {
-      args.push("--proxy-mode", "sse", "--target-port", "3000");
+      let targetPort = 3000;
+      try {
+        const insp = await execFileHidden("docker", ["inspect", "--format", "{{json .Config.ExposedPorts}}", image], { timeout: 15000, maxBuffer: MAX_BUFFER });
+        const exposed = JSON.parse(String(insp.stdout || "{}").trim() || "{}");
+        const keys = Object.keys(exposed);
+        if (keys.length) {
+          const hit = keys.find((k) => String(k).split("/")[0] === "3000") || keys[0];
+          targetPort = parseInt(String(hit).split("/")[0], 10) || 3000;
+        }
+      } catch (_) { /* 读不到 EXPOSE 就用约定 3000 */ }
+      args.push("--proxy-mode", "sse", "--target-port", String(targetPort));
     } else if (meta.transport === "sse") {
       args.push("--proxy-mode", "sse");
     }
@@ -747,12 +790,24 @@ async function deployMcp(id) {
     const entry = list.find((x) => x.name === workload);
     if (entry) {
       lastStatus = entry.status;
-      if (entry.url) { endpoint = entry.url; break; }
+      if (entry.url) {
+        // thv 报告 url 只代表代理端口已监听，不代表上游容器服务就绪（端口指错时代理会
+        // 持续 502，曾把 502 的部署误判成 deployed）。加一次 HTTP 探活：
+        // 502/503 视为未就绪继续等；其余任何响应（含 4xx，如 MCP 的 406）都算上游可达。
+        try {
+          const probe = await fetch(entry.url, { signal: AbortSignal.timeout(3000) });
+          if (probe.status !== 502 && probe.status !== 503) { endpoint = entry.url; break; }
+        } catch (_) { /* 探测异常（超时/拒连）说明上游未就绪，继续轮询而非误判 deployed */ }
+      }
     }
     await sleep(3000);
   }
   if (endpoint) {
     patchMeta(id, { deploy_status: "deployed", endpoint, deploy_error: "" });
+    // 提取镜像元数据（脱敏后）供详情页「代码」标签展示；失败不影响部署结果
+    extractMcpInspect(image).then((insp) => {
+      if (insp) patchMeta(id, { mcp_inspect: insp });
+    }).catch(() => {});
     // 源码构建的镜像：部署成功后补一次 Trivy 扫描（本地镜像直扫，结果入 meta.trivy 供审计）
     if (meta.source_type === "source" || !meta.artifact_key) {
       runTrivyScan(id);
@@ -1189,12 +1244,27 @@ async function findMcpMainContainer(workload) {
       Object.keys(nets).find((n) => n.includes("-internal")) ||
       Object.keys(nets)[0];
     const ip = netName ? nets[netName].IPAddress : null;
-    // MCP 监听端口：优先容器 env 的 MCP_PORT / FASTMCP_PORT，否则暴露端口
-    const env = (info.Config && info.Config.Env) || [];
+    // MCP 监听端口。注意容器 env 里的 MCP_PORT / FASTMCP_PORT 是 thv 按 --target-port
+    // 回写的"假设值"（写死 3000 时代它会跟着错），不是事实——-authoritative 是镜像自己的
+    // EXPOSE（作者声明）。容器 Config.ExposedPorts 也会被 thv 追加污染，所以查镜像配置。
     let port = null;
-    const pv = env.find((e) => e.startsWith("MCP_PORT=")) ||
-                env.find((e) => e.startsWith("FASTMCP_PORT="));
-    if (pv) port = Number(pv.split("=")[1]) || null;
+    try {
+      const imgRef = (info.Config && info.Config.Image) || workload;
+      const imgOut = await execFileHidden("docker", ["inspect", "--format", "{{json .Config.ExposedPorts}}", imgRef], { timeout: 12000, maxBuffer: MAX_BUFFER });
+      const imgExposed = JSON.parse(String(imgOut.stdout || "{}").trim() || "{}");
+      const keys = Object.keys(imgExposed);
+      if (keys.length) {
+        // 多端口时优先平台约定的 3000，否则取第一个
+        const hit = keys.find((k) => String(k).split("/")[0] === "3000") || keys[0];
+        port = Number(String(hit).split("/")[0]) || null;
+      }
+    } catch (_) { /* 镜像配置读不到再走 env/端口映射回退 */ }
+    if (!port) {
+      const env = (info.Config && info.Config.Env) || [];
+      const pv = env.find((e) => e.startsWith("MCP_PORT=")) ||
+                  env.find((e) => e.startsWith("FASTMCP_PORT="));
+      if (pv) port = Number(pv.split("=")[1]) || null;
+    }
     if (!port) {
       const ex = (info.NetworkSettings && info.NetworkSettings.Ports) || {};
       port = Number(Object.keys(ex)[0] && Object.keys(ex)[0].split("/")[0]) || null;
@@ -1217,6 +1287,10 @@ function stablePortFor(workload, offset = 0) {
 //      rebuild=true（部署/自愈）时重建为固定端口 socat ingress
 //   3) 坏 ingress（端口在但 502）或无 ingress → 重建；固定端口被占时线性后移重试
 // 返回实际可用的 host 端口；彻底失败时回退现有动态端口（若有）。
+// 同一 workload 的 ingress 重建任务表（单飞）：并发重建会互相 rm 掉对方刚建好的
+// 容器，造成 ingress 反复抖动、接口拖死——同 workload 的重建必须共享一个任务
+const ingressRebuildJobs = new Map();
+
 async function ensureStableIngress(workload, meta = {}, { rebuild = true } = {}) {
   const fixed = Number(meta && meta.ingress_port) || stablePortFor(workload);
   const cur = await getIngressPort(workload);
@@ -1226,9 +1300,20 @@ async function ensureStableIngress(workload, meta = {}, { rebuild = true } = {})
     if (!rebuild) return Number(cur);
   }
   if (!rebuild) return null;
+  let job = ingressRebuildJobs.get(workload);
+  if (!job) {
+    job = rebuildIngress(workload, cur).finally(() =>
+      ingressRebuildJobs.delete(workload),
+    );
+    ingressRebuildJobs.set(workload, job);
+  }
+  return job;
+}
+
+async function rebuildIngress(workload, cur) {
+  const ingressName = `${workload}-ingress`;
   const main = await findMcpMainContainer(workload);
   if (!main || !main.ip || !main.port) return cur ? Number(cur) : null;
-  const ingressName = `${workload}-ingress`;
   // 需要 external 网络作 host publish 通道
   let extNet = "toolhive-external";
   try {
@@ -1342,10 +1427,12 @@ app.use("/mcp-proxy/:name", (req, res) => {
   // mode=all（含内置 LIVE_MCPS）放行，现有用户复制的配置完全不受影响。
   const name = req.params.name;
   const sid = subIdByWorkload(name) || (String(name).startsWith("sub_") ? name : null);
+  let proxyMeta = null;
   if (sid) {
     const row = db.prepare("SELECT meta FROM submissions WHERE id=?").get(sid);
     if (row) {
       const meta = parseMeta(row);
+      proxyMeta = meta;
       const v = meta.visibility;
       if (v && v.mode === "restricted") {
         // token 三来源（按优先级）：Authorization: Bearer / X-MCP-Token 头 / 旧 ?t=（兼容已复制配置）
@@ -1378,6 +1465,13 @@ app.use("/mcp-proxy/:name", (req, res) => {
       const headers = { ...req.headers };
       delete headers.host;
       delete headers.connection;
+      // 平台凭证代理：条目 env 里配了 API Key/Token 时，把调用方的平台凭证
+      // （mcp_token）替换为应用自身的鉴权头再转发——调用方无需（也不应）知道应用凭证。
+      const appAuth = authHeaderCandidates(proxyMeta || {})[0];
+      if (appAuth) {
+        delete headers.authorization;
+        Object.assign(headers, appAuth);
+      }
 
       const upstream = http.request(
         {
@@ -1608,7 +1702,7 @@ app.get("/", (_req, res) => res.json({
   service: "platform-backend",
   endpoints: [
     "POST /submissions", "GET /submissions", "POST /submissions/:id/approve", "POST /submissions/:id/deploy", "POST /submissions/:id/undeploy", "POST /submissions/:id/sync",
-    "GET /groups/:group_key/versions", "POST /groups/:group_key/activate/:id",
+    "GET /groups/:group_key/versions",
     "POST /favorites", "DELETE /favorites", "GET /favorites", "GET /favorites/counts",
     "GET /skills", "GET /skills/:group_key/:version/download", "GET /skills/:id/download",
     "GET /mcp", "GET /mcp/:id", "POST /mcp/call", "GET /stats/top", "GET /stats/detail", "GET /stats/counts", "POST /metrics", "GET /health"
@@ -1818,10 +1912,8 @@ app.post("/submissions/:id/approve", async (req, res) => {
   // 同步到 Registry Server：先落注册名/版本，便于后续下线/删除时定位条目
   const gv = ensureGroupMeta(sub);
   ensureRegistryMeta(sub);
-  // 首个版本自动激活；后续版本需管理员手动「升级」切换（支持滚动发布/回滚）
-  if (!getActiveSubmissionId(gv.group_key)) {
-    setActiveSubmission(gv.group_key, sub.type, id);
-  }
+  // 2026-09-08：active_versions 指针已废弃——用户侧版本下拉可自选已上架版本，
+  // 目录默认展示"最新已上架版本"（见 pickDisplayVersions），不再维护激活指针。
   if (sub.type === "skill") {
     // 审批通过：先把 staging 待审暂存区的制品提升(promote)到 published 已发布区。
     // 注意：不在此处 registryPublish —— Skill 默认未上线(visibility_configured=false)，
@@ -1875,6 +1967,19 @@ app.post("/submissions/:id/approve", async (req, res) => {
     }
     // 部署状态保持未设置（即 unborn / 未部署），管理员在「已发布管理」里点「部署」才真正拉起。
     // 不写 deploy_status，让前端按其默认态渲染「未部署 + 部署按钮」。
+    // 源码包提交（source_type=source）：解包提取 README 回写 meta，供详情页 README 标签展示。
+    // 复用 Skill 包解包逻辑，失败不阻断审批主流程。
+    if (meta.source_type === "source" && meta.artifact_key) {
+      inspectSkillPackage(meta.artifact_key).then((insp) => {
+        if (insp) patchMeta(id, {
+          mcp_readme: insp.readme,
+          mcp_readme_name: insp.readme_name,
+          mcp_tree: (insp.tree || []).slice(0, MCP_TREE_MAX),
+          mcp_file_count: insp.file_count,
+          mcp_readme_inspected: MCP_README_INSPECT_VERSION,
+        });
+      }).catch((e) => console.error("[inspect] mcp 源码包解包失败:", id, e && e.message));
+    }
   }
   res.json({ id, status: "approved" });
 });
@@ -1935,16 +2040,10 @@ app.post("/submissions/:id/sync", async (req, res) => {
   res.json({ id, ok: true, registry_synced: rs });
 });
 
-// 查询所有当前激活版本（供管理后台聚合展示）
-app.get("/active-versions", (_req, res) => {
-  const rows = db.prepare("SELECT * FROM active_versions ORDER BY group_key").all();
-  res.json(rows);
-});
-
 // 查询某逻辑产品下的所有已发布版本（MCP / Skill 多版本管理）
+// （原 GET /active-versions 与 POST /groups/:group_key/activate/:id 已随激活指针废弃移除）
 app.get("/groups/:group_key/versions", (req, res) => {
   const { group_key } = req.params;
-  const activeId = getActiveSubmissionId(group_key);
   const versions = listGroupVersions(group_key).map((s) => {
     const m = parseMeta(s);
     return {
@@ -1956,26 +2055,11 @@ app.get("/groups/:group_key/versions", (req, res) => {
       download_url: m.download_url || "",
       deploy_status: m.deploy_status || "unborn",
       registry_synced: m.registry_synced || "",
-      active: s.id === activeId,
       on_shelf: isOnShelf(m), // 是否已上线（管理员配过可见范围）——仅上架版本可被普通用户选择
       created_at: s.created_at,
     };
   });
-  res.json({ group_key, active_submission_id: activeId, versions });
-});
-
-// 切换某逻辑产品的当前激活版本（滚动升级 / 回滚）
-app.post("/groups/:group_key/activate/:id", (req, res) => {
-  const { group_key, id } = req.params;
-  const sub = db.prepare("SELECT * FROM submissions WHERE id=?").get(id);
-  if (!sub) return res.status(404).json({ error: "submission 不存在" });
-  if (sub.status !== "approved")
-    return res.status(400).json({ error: "仅已发布条目可设为激活版本" });
-  const m = parseMeta(sub);
-  if (m.group_key !== group_key)
-    return res.status(400).json({ error: "该提交不属于此产品组" });
-  setActiveSubmission(group_key, sub.type, id);
-  res.json({ group_key, active_submission_id: id });
+  res.json({ group_key, versions });
 });
 
 // 生命周期状态变更（管理者操作：下架 deprecated / 删除 removed 等）
@@ -2041,15 +2125,14 @@ app.post("/submissions/:id/status", async (req, res) => {
   res.json({ id, status });
 });
 
-// 已审批 skill 列表（供 /skills 浏览页）。多版本场景下只展示每个 group 当前激活的版本。
+// 已审批 skill 列表（供 /skills 浏览页）。多版本场景下每 group 只展示最新已上架的版本。
 app.get("/skills", (req, res) => {
   const actor = actorFromReq(req);
   const rows = db.prepare(
     "SELECT * FROM submissions WHERE type='skill' AND status='approved' ORDER BY created_at DESC"
   ).all();
-  const activeRows = db.prepare("SELECT * FROM active_versions WHERE item_type='skill'").all();
   // 可见性过滤：restricted 条目仅对被授权的成员/组与管理员可见
-  const displayRows = pickDisplayVersions(rows, activeRows)
+  const displayRows = pickDisplayVersions(rows)
     .filter((s) => canAccessSubmission(parseMeta(s), actor));
 
   const dls = db.prepare(
@@ -2086,16 +2169,52 @@ app.get("/skills", (req, res) => {
 
 // Skill 单条（按 submission id），对齐 /mcp/:id 语义：
 // 供技能列表卡片版本下拉「就地切换」时按版本取回完整数据。仅当前用户可访问(上架+可见)才返回。
-app.get("/skills/:id", (req, res) => {
+// Skill 源码包元数据懒回填：老记录审批时还没有提取逻辑（skill_readme/skill_tree 为空），
+// 详情接口首次访问时补提取一次并落 meta。有 artifact_key 但未提取过的才解包，只做一次。
+const SKILL_PKG_INSPECT_VERSION = 1;
+async function ensureSkillPackageMeta(s) {
+  const meta = parseMeta(s);
+  if (!meta.artifact_key) return {};
+  if (meta.skill_pkg_inspected === SKILL_PKG_INSPECT_VERSION) {
+    return {
+      skill_readme: meta.skill_readme || null,
+      skill_readme_name: meta.skill_readme_name || null,
+      skill_tree: meta.skill_tree || [],
+      skill_file_count: meta.skill_file_count || 0,
+    };
+  }
+  const insp = await inspectSkillPackage(meta.artifact_key).catch(() => null);
+  const patch = {
+    skill_pkg_inspected: SKILL_PKG_INSPECT_VERSION,
+    skill_readme: (insp && insp.readme) || null,
+    skill_readme_name: (insp && insp.readme_name) || null,
+    skill_tree: insp && insp.tree ? insp.tree.slice(0, MCP_TREE_MAX) : [],
+    skill_file_count: insp ? insp.file_count : 0,
+  };
+  patchMeta(s.id, patch);
+  return {
+    skill_readme: patch.skill_readme,
+    skill_readme_name: patch.skill_readme_name,
+    skill_tree: patch.skill_tree,
+    skill_file_count: patch.skill_file_count,
+  };
+}
+
+app.get("/skills/:id", async (req, res) => {
   const { id } = req.params;
   const s = db.prepare("SELECT * FROM submissions WHERE id=?").get(id);
-  if (!s || s.type !== "skill") return res.status(404).json({ error: "skill 不存在" });
+  if (!s || s.type !== "skill") return res.status(404).json({ error: "该技能不存在或已被移除" });
+  // 未审批/已下架(deprecated)/已删除(removed) 对用户不可见，与列表口径一致
+  if (s.status !== "approved")
+    return res.status(404).json({ error: "该技能不存在或已下架" });
   if (!canAccessSubmission(parseMeta(s), actorFromReq(req)))
     return res.status(403).json({ error: "你没有权限查看该 Skill（未获管理员授权）" });
   const meta = parseMeta(s);
   const dl = db
     .prepare("SELECT COUNT(*) c FROM metric_events WHERE item_type='skill' AND event='download' AND item_ref=?")
     .get(s.id);
+  // 源码包 README/文件树懒回填（老记录首次访问时补提取一次）
+  const pkgMeta = await ensureSkillPackageMeta(s);
   res.json({
     id: s.id,
     item_ref: s.id,
@@ -2112,10 +2231,10 @@ app.get("/skills/:id", (req, res) => {
     group_key: meta.group_key || s.payload_ref,
     version: meta.version || "1.0.0",
     repository_url: meta.repository_url || "",
-    skill_readme: meta.skill_readme || null,
-    skill_readme_name: meta.skill_readme_name || null,
-    skill_tree: meta.skill_tree || [],
-    skill_file_count: meta.skill_file_count || 0,
+    skill_readme: pkgMeta.skill_readme ?? meta.skill_readme ?? null,
+    skill_readme_name: pkgMeta.skill_readme_name ?? meta.skill_readme_name ?? null,
+    skill_tree: pkgMeta.skill_tree ?? meta.skill_tree ?? [],
+    skill_file_count: pkgMeta.skill_file_count ?? meta.skill_file_count ?? 0,
   });
 });
 
@@ -2179,15 +2298,14 @@ app.get("/skills/:id/download", async (req, res) => {
   await streamSkillArtifact(req, res, s);
 });
 
-// 已审批 mcp 列表（供 /catalog 浏览页）。多版本场景下只展示每个 group 当前激活的版本。
+// 已审批 mcp 列表（供 /catalog 浏览页）。多版本场景下每 group 只展示最新已上架的版本。
 app.get("/mcp", async (req, res) => {
   const actor = actorFromReq(req);
   const rows = db.prepare(
     "SELECT * FROM submissions WHERE type='mcp' AND status='approved' ORDER BY created_at DESC"
   ).all();
-  const activeRows = db.prepare("SELECT * FROM active_versions WHERE item_type='mcp'").all();
   // 可见性过滤：restricted 条目仅对被授权的成员/组与管理员可见
-  const displayRows = pickDisplayVersions(rows, activeRows)
+  const displayRows = pickDisplayVersions(rows)
     .filter((s) => canAccessSubmission(parseMeta(s), actor));
   const calls = db.prepare(
     "SELECT item_ref, COUNT(*) c FROM metric_events WHERE item_type='mcp' AND event='call' GROUP BY item_ref"
@@ -2212,7 +2330,7 @@ app.get("/mcp", async (req, res) => {
   const epMap = new Map();
   await Promise.all(
     deployed.map(async (s) => {
-      const ep = await discoverIngressForSubmission(s);
+      const ep = await discoverIngressForSubmission(s, { rebuild: false });
       if (!ep) return;
       // 真实探活：容器被清理、进程崩溃后，discoverIngressForSubmission 会回退到
       // meta.endpoint 里的陈旧值，不探测就会把不可用的 MCP 展示成可复制配置的状态。
@@ -2260,6 +2378,96 @@ app.get("/mcp", async (req, res) => {
   res.json([...mcpRows, ...liveRows]);
 });
 
+// ---- 镜像元数据提取（docker inspect，供详情页「代码」标签展示）----
+// 安全红线：Env 一律不提取不展示（镜像常在 ENV 里内置密钥）；entrypoint/cmd 参数与
+// labels 按敏感模式（password/secret/token/api key/credential/auth 等）脱敏后才返回。
+const INSPECT_SENSITIVE_RE = /(pass(word|wd)?|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential|auth(orization)?|cookie|session|cert|key)/i;
+function maskInspectToken(tok) {
+  const s = String(tok);
+  if (!INSPECT_SENSITIVE_RE.test(s)) return s;
+  const eq = s.indexOf("=");
+  // key=value 形态保留键名、掩去值；其余整段掩掉
+  if (eq > 0 && !/\s/.test(s.slice(0, eq))) return s.slice(0, eq + 1) + "******";
+  return "******";
+}
+function maskInspectLabels(map) {
+  const out = {};
+  for (const [k, v] of Object.entries(map || {})) {
+    out[k] = INSPECT_SENSITIVE_RE.test(k) ? "******" : String(v);
+  }
+  return out;
+}
+async function extractMcpInspect(imageRef) {
+  try {
+    const { stdout } = await execFileHidden(
+      "docker", ["inspect", "--format", "{{json .Config}}", imageRef],
+      { timeout: 15000, maxBuffer: MAX_BUFFER },
+    );
+    const cfg = JSON.parse(String(stdout).trim() || "{}");
+    const insp = {};
+    if (cfg.Labels && Object.keys(cfg.Labels).length) insp.labels = maskInspectLabels(cfg.Labels);
+    if (cfg.ExposedPorts) insp.exposed_ports = Object.keys(cfg.ExposedPorts);
+    if (Array.isArray(cfg.Entrypoint) && cfg.Entrypoint.length) insp.entrypoint = cfg.Entrypoint.map(maskInspectToken);
+    if (Array.isArray(cfg.Cmd) && cfg.Cmd.length) insp.cmd = cfg.Cmd.map(maskInspectToken);
+    if (cfg.WorkingDir) insp.working_dir = cfg.WorkingDir;
+    // 注意：绝不携带 cfg.Env
+    return Object.keys(insp).length ? insp : null;
+  } catch (_) {
+    return null;
+  }
+}
+// 懒回填：功能上线前已部署成功的记录没有镜像元数据，详情页首次访问时补提取一次
+async function ensureMcpInspect(s) {
+  const meta = parseMeta(s);
+  if (meta.deploy_status !== "deployed" || meta.mcp_inspect) return {};
+  const image = meta.deployed_image || meta.recovery_image || meta.internal_ref || meta.image_ref;
+  if (!image) return {};
+  const insp = await extractMcpInspect(image);
+  if (insp) {
+    patchMeta(s.id, { mcp_inspect: insp });
+    return { mcp_inspect: insp };
+  }
+  return {};
+}
+
+// MCP 源码包 README + 文件树懒回填：功能上线前审批的源码提交没有提取过，
+// 详情页首次访问时补提取一次并落 meta。mcp_readme_inspected 存提取规则版本号，
+// 规则升级后旧记录会自动用新规则重提一次。
+// v3：新增文件树提取（mcp_tree），供「代码」标签页展示 zip 包内文件。
+const MCP_README_INSPECT_VERSION = 3;
+// 文件树最多落库条数，防止超大包把 meta 撑爆
+const MCP_TREE_MAX = 2000;
+// 敏感文件不提供内容预览（文件名可列出，内容读取接口会拒绝）
+const MCP_SENSITIVE_FILE_RE = /(^|\/)(\.env[^/]*|[^/]*\.(pem|key|p12|pfx|jks|keystore|htpasswd)|id_rsa[^/]*|[^/]*(secret|password|passwd|credential|api[_-]?key)[^/]*)$/i;
+
+async function ensureMcpReadme(s) {
+  const meta = parseMeta(s);
+  if (meta.source_type !== "source" || !meta.artifact_key) return {};
+  if (meta.mcp_readme_inspected === MCP_README_INSPECT_VERSION) {
+    return {
+      mcp_readme: meta.mcp_readme || null,
+      mcp_readme_name: meta.mcp_readme_name || null,
+      mcp_tree: meta.mcp_tree || null,
+      mcp_file_count: meta.mcp_file_count ?? null,
+    };
+  }
+  const insp = await inspectSkillPackage(meta.artifact_key).catch(() => null);
+  const patch = {
+    mcp_readme_inspected: MCP_README_INSPECT_VERSION,
+    mcp_readme: (insp && insp.readme) || null,
+    mcp_readme_name: (insp && insp.readme_name) || null,
+    mcp_tree: insp && insp.tree ? insp.tree.slice(0, MCP_TREE_MAX) : null,
+    mcp_file_count: insp ? insp.file_count : null,
+  };
+  patchMeta(s.id, patch);
+  return {
+    mcp_readme: patch.mcp_readme,
+    mcp_readme_name: patch.mcp_readme_name,
+    mcp_tree: patch.mcp_tree,
+    mcp_file_count: patch.mcp_file_count,
+  };
+}
+
 // 单个 mcp 详情（供 /mcp/[ref] 详情页）
 app.get("/mcp/:id", async (req, res) => {
   const s = db.prepare("SELECT * FROM submissions WHERE id=?").get(req.params.id);
@@ -2303,6 +2511,10 @@ app.get("/mcp/:id", async (req, res) => {
     "SELECT COUNT(*) c FROM favorites WHERE item_type='mcp' AND item_ref=?"
   ).get(s.id);
   const row = mapMcpRow(s, { [s.id]: calls.c }, { [s.id]: favs.c });
+  // 源码包 README（懒回填：历史提交首次访问时补提取一次，之后读 meta）
+  Object.assign(row, await ensureMcpReadme(s));
+  // 镜像元数据（懒回填：已部署但未提取过的记录首次访问时补一次）
+  Object.assign(row, await ensureMcpInspect(s));
   // 部署时 thv list 报告的内部端口可能不可达；详情页返回前重新动态发现 ingress 端口。
   const reachableEp = await discoverIngressForSubmission(s);
   if (reachableEp) row.endpoint = reachableEp;
@@ -2323,6 +2535,73 @@ app.get("/mcp/:id", async (req, res) => {
   res.json(row);
 });
 
+// 源码包单文件内容预览（「代码」标签页点文件查看）。
+// 安全约束：路径必须存在于文件树中且通过 traversal 校验；敏感文件（.env/密钥/凭据类）拒绝读取；
+// 仅返回文本内容（探测到二进制或超过 256KB 时拒绝），值不落盘、即取即回。
+// 源码包单文件内容预览的共享实现（MCP 与 Skill 共用）。
+// 安全约束：路径必须存在于文件树中且通过 traversal 校验；敏感文件（.env/密钥/凭据类）拒绝读取；
+// 仅返回文本内容（探测到二进制或超过 256KB 时拒绝），值不落盘、即取即回。
+async function servePackageFile(req, res, s) {
+  const meta = parseMeta(s);
+  // 注意：skill 提交没有 source_type 字段，这里只以 artifact_key 为准
+  if (!meta.artifact_key) {
+    return res.status(400).json({ error: "该记录没有源码包" });
+  }
+  const filePath = String(req.query.path || "");
+  if (isPathTraversal(filePath)) {
+    return res.status(400).json({ error: "非法路径" });
+  }
+  if (MCP_SENSITIVE_FILE_RE.test(filePath)) {
+    return res.status(403).json({ error: "疑似敏感文件（.env/密钥/凭据类），不提供内容预览" });
+  }
+  const tree = meta.mcp_tree || meta.skill_tree || [];
+  if (tree.length && !tree.includes(filePath)) {
+    return res.status(404).json({ error: "文件不在源码包内" });
+  }
+  let obj;
+  try { obj = await objStore.get(meta.artifact_key); } catch (_) {}
+  if (!obj || !obj.buffer) return res.status(404).json({ error: "源码包不存在或已清理" });
+  const pkg = await openSkillPackage(obj.buffer, String(meta.artifact_key).toLowerCase());
+  if (pkg.error) return res.status(500).json({ error: "源码包解压失败" });
+  try {
+    const entry = pkg.entries.find(
+      (e) => e === filePath || e.replace(/\\/g, "/") === filePath.replace(/\\/g, "/")
+    );
+    if (!entry) return res.status(404).json({ error: "文件不在源码包内" });
+    const buf = await pkg.readEntry(entry);
+    if (!buf) return res.status(404).json({ error: "文件内容为空或读取失败" });
+    // 二进制探测：前 8KB 出现 NUL 字节视为二进制；文本上限 256KB
+    const probe = buf.subarray(0, 8192);
+    if (probe.includes(0)) {
+      return res.status(415).json({ error: "二进制文件不支持预览" });
+    }
+    if (buf.length > 256 * 1024) {
+      return res.status(413).json({ error: "文件过大（>256KB），不支持预览" });
+    }
+    res.json({ path: entry, content: buf.toString("utf8"), size: buf.length });
+  } finally {
+    if (pkg.cleanup) pkg.cleanup();
+  }
+}
+
+app.get("/mcp/:id/file", async (req, res) => {
+  const s = db.prepare("SELECT * FROM submissions WHERE id=?").get(req.params.id);
+  if (!s) return res.status(404).json({ error: "mcp 不存在" });
+  if (!canAccessSubmission(parseMeta(s), actorFromReq(req))) {
+    return res.status(403).json({ error: "你没有权限查看该 MCP（未获管理员授权）" });
+  }
+  await servePackageFile(req, res, s);
+});
+
+app.get("/skills/:id/file", async (req, res) => {
+  const s = db.prepare("SELECT * FROM submissions WHERE id=?").get(req.params.id);
+  if (!s || s.type !== "skill") return res.status(404).json({ error: "skill 不存在" });
+  if (!canAccessSubmission(parseMeta(s), actorFromReq(req))) {
+    return res.status(403).json({ error: "你没有权限查看该 Skill（未获管理员授权）" });
+  }
+  await servePackageFile(req, res, s);
+});
+
 // 真实 MCP 工具清单：按 id 找到运行中实例，调用 tools/list 返回真实能力。
 // 无运行实例或调用失败均优雅降级为 { tools: [], live: false }，不阻塞详情页；
 // 用 8s 超时 Promise.race 防止挂住前端详情页渲染。
@@ -2339,14 +2618,29 @@ app.get("/mcp/:id/tools", async (req, res) => {
     }
   }
   if (!ep) return res.json({ tools: [], live: false });
+  const dbg = req.query.debug === "1" ? {} : null;
   const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("tools/list 超时")), 8000));
   try {
-    const r = await Promise.race([mcpCall(ep, {}), timeout]);
+    // 应用自带 API Key 鉴权时自动携带（env 候选逐个尝试），否则工具清单被 401 挡成空列表
+    if (dbg) dbg.candidates = authHeaderCandidates(s ? parseMeta(s) : {}).length;
+    if (dbg && s) {
+      const c0 = authHeaderCandidates(parseMeta(s))[0];
+      dbg.keyFp = c0 ? require("crypto").createHash("sha256").update(c0.Authorization.slice(7)).digest("hex").slice(0, 12) : null;
+      dbg.ep = ep;
+    }
+    const r = await Promise.race([mcpCallAuthed(ep, {}, s ? parseMeta(s) : {}), timeout]);
+    if (dbg) { dbg.status = r && r.status; dbg.stage = r && r.stage; dbg.lastEvent = JSON.stringify((r.events && r.events[r.events.length - 1]) || {}).slice(0, 300); }
     const last = (r.events && r.events[r.events.length - 1]) || {};
     const tools = last.result && Array.isArray(last.result.tools) ? last.result.tools : [];
     return res.json({
-      tools: tools.map((t) => ({ name: t.name, description: t.description || "" })),
+      tools: tools.map((t) => ({
+        name: t.name,
+        description: t.description || "",
+        // 前端按 schema 生成参数模板（字段名/类型/必填），剥离后模板会退化成 {}
+        ...(t.inputSchema ? { inputSchema: t.inputSchema } : {}),
+      })),
       live: true,
+      ...(dbg ? { debug: dbg } : {}),
     });
   } catch (e) {
     return res.json({ tools: [], live: false, error: String((e && e.message) || e) });
@@ -2367,8 +2661,11 @@ app.post("/mcp/call", async (req, res) => {
   if (ref) {
     s = db.prepare("SELECT * FROM submissions WHERE id=? OR payload_ref=?").get(ref, ref);
     if (!s) {
-      const activeId = getActiveSubmissionId(ref);
-      if (activeId) s = db.prepare("SELECT * FROM submissions WHERE id=?").get(activeId);
+      // ref 是 group_key：回落该组最新已上架版本（激活指针已废弃）
+      s = db.prepare(
+        "SELECT * FROM submissions WHERE status='approved' AND (meta LIKE ? OR payload_ref=?) ORDER BY created_at DESC"
+      ).all(`%"group_key":"${ref}"%`, ref)
+       .find((row) => isOnShelf(parseMeta(row)));
     }
   }
   if (s) {
@@ -2394,7 +2691,8 @@ app.post("/mcp/call", async (req, res) => {
     });
   }
   try {
-    const result = await mcpCall(ep, { tool, args });
+    // 平台代调同样自动携带应用自身的 API Key（用户无需也不应知道应用凭证）
+    const result = await mcpCallAuthed(ep, { tool, args }, s ? parseMeta(s) : {});
     // 仅在真正执行了某个工具时才记一次调用指标，保持统计语义
     if (tool) {
       db.prepare("INSERT INTO metric_events VALUES(?,?,?,?,?,?)")
@@ -2587,6 +2885,18 @@ app.put("/issues/:id", (req, res) => {
   res.json({ id, status: newStatus });
 });
 
+// 删除 Issue（仅管理员，兜底操作；正常清理以关闭代替删除，对齐 GitHub 模型）
+app.delete("/issues/:id", (req, res) => {
+  const actor = actorFromReq(req);
+  if (!actor.admin) return res.status(403).json({ error: "仅管理员可删除反馈" });
+  const { id } = req.params;
+  const row = db.prepare("SELECT * FROM issues WHERE id=?").get(id);
+  if (!row) return res.status(404).json({ error: "issue 不存在" });
+  db.prepare("DELETE FROM issues WHERE id=?").run(id);
+  audit(req, "issue_delete", row.target_type, id, { title: row.title, author: row.author });
+  res.json({ ok: true, id });
+});
+
 // 统一审计轨迹查询（仅管理员）。过滤：actor / action / target_id / from / to（ISO 日期）。
 app.get("/audit", (req, res) => {
   const actor = actorFromReq(req);
@@ -2630,13 +2940,34 @@ app.post("/metrics", (req, res) => {
 
 // 显式绑 0.0.0.0：WSL2 下 localhost 常解析到 127.0.0.1，
 // 若只绑默认的 IPv6 :: 会导致 curl localhost 连接被拒。
-const server = app.listen(PORT, "0.0.0.0", () =>
-  console.log(`平台后端已启动: http://localhost:${PORT} (0.0.0.0:${PORT})`)
+const server = app.listen(PORT, HOST, () =>
+  console.log(`平台后端已启动: http://localhost:${PORT} (${HOST}:${PORT})`)
 );
 server.on("error", (err) => {
   console.error("监听失败（端口可能被占用或权限不足）:", err);
   process.exit(1);
 });
+
+// ---- 启动对账：卡在「扫描中」的提交重新排队 ----
+// 扫描是 fire-and-forget：后端进程在扫描完成前重启/崩溃，异步任务连同超时定时器一起丢失，
+// meta.trivy / meta.prompt_scan 会永远停在 scanning（2026-09-07 flowvision 首条提交即此情况）。
+// 启动后统一检查，把卡在 scanning 的记录重新入队（runSubmissionScans 内部为全局串行队列）。
+function requeueStuckScans() {
+  let n = 0;
+  const rows = db.prepare("SELECT id, type, meta FROM submissions").all();
+  for (const r of rows) {
+    let m;
+    try { m = JSON.parse(r.meta || "{}"); } catch { continue; }
+    const trivyStuck = m.trivy && m.trivy.status === "scanning";
+    const promptStuck = m.prompt_scan && m.prompt_scan.status === "scanning";
+    if (trivyStuck || promptStuck) {
+      runSubmissionScans(r.id, r.type);
+      n++;
+    }
+  }
+  if (n) console.log(`[scan] 启动对账：${n} 条提交卡在扫描中，已重新排队`);
+}
+requeueStuckScans();
 
 // ---- 后台自愈（「健康探测自愈」层）：每 60s 巡检所有 deployed MCP 的固定端口 ingress ----
 // 探测失败 → 重建 socat ingress（端口不变，hash 派生）→ 回写 meta.endpoint。
