@@ -920,12 +920,26 @@ function ensureRegistryMeta(sub) {
 
 // 发布到 Registry Server。MCP 需等部署拿到 endpoint 后再调；Skill 审批时即可发。
 
+// WSL 环境：/proc/version 含 microsoft。WSL 内的非回环 IPv4 是 NAT 地址，
+// 对外不可路由、宿主机也无法直连——宁可回退 localhost，不能给"像样的错误地址"。
+const IS_WSL = (() => {
+  try {
+    return /microsoft/i.test(require("fs").readFileSync("/proc/version", "utf8"));
+  } catch (_) {
+    return false;
+  }
+})();
+
 // 本机第一个非回环 IPv4（内网地址）。未显式设 PUBLIC_BASE 时用它兜底，
 // 避免对外分发的地址是 127.0.0.1（跨机不可达）。启动时探测一次，开销可忽略。
 const LAN_IP = (() => {
+  if (IS_WSL) return null; // WSL 内探测到的必是 NAT 地址，禁用
   try {
     const nets = os.networkInterfaces();
-    for (const list of Object.values(nets)) {
+    for (const [ifName, list] of Object.entries(nets)) {
+      // 排除虚拟交换机网卡（WSL/Hyper-V/Docker）——其地址对局域网不可达，
+      // 否则会像 172.20.155.243 那样生成"看起来像样但谁都连不上"的调用 URL
+      if (/vethernet|wsl|hyper-v|docker|loopback/i.test(ifName)) continue;
       for (const n of list || []) {
         if (n.family === "IPv4" && !n.internal && n.address) return n.address;
       }
@@ -951,6 +965,12 @@ function publicBase(req) {
   }
   if (LAN_IP) return `http://${LAN_IP}:${PORT}`;
   return `http://localhost:${PORT}`;
+}
+// 启动时告警一次：回退 localhost 意味着跨机器不可达，提醒部署者显式声明基址
+if (!process.env.PUBLIC_BASE && !LAN_IP) {
+  console.warn(
+    "[publicBase] 未设置 PUBLIC_BASE 且未探测到真实内网 IP：对外地址回退 localhost（仅本机可用）。跨机器访问请设置 PUBLIC_BASE，如 http://<Windows局域网IP>:4000",
+  );
 }
 
 // 终端用户访问某个 MCP 的固定入口：走平台后端的反向代理（端口即后端自身端口）。
