@@ -1,0 +1,40 @@
+# ===== 运行时数据（绝不入库）=====
+*.log
+*.db
+*.db-shm
+*.db-wal
+uploads/
+backups/
+object-store/
+
+# ===== 大体积二进制/制品 =====
+tools/
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+
+# ===== 依赖 =====
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+
+# ===== 机密与环境 =====
+.env
+.env.*
+!.env.example
+
+# ===== 历史/临时 =====
+*.bak
+*~
+_t_*.js
+
+# ===== 系统 =====
+Thumbs.db
+.DS_Store
+
+# ===== AI 工具数据 =====
+.workbuddy/
+_tmp_*
+*.corrupt/
