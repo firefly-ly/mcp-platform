@@ -2043,6 +2043,22 @@ app.post("/submissions/:id/undeploy", async (req, res) => {
   res.json({ id, deploy_status: "undeployed" });
 });
 
+// 轮换代理访问令牌（仅管理员，仅 MCP）：生成新 mcp_token 覆盖旧值。
+// 旧 Token 立即作废——所有已复制到客户端的接入配置会 401，需重新复制配置；
+// 其他 MCP 不受影响（token 本就是 per-MCP 一把）。写审计轨迹备查。
+app.post("/submissions/:id/rotate-token", (req, res) => {
+  const actor = actorFromReq(req);
+  if (!actor.admin) return res.status(403).json({ error: "仅管理员可轮换 Token" });
+  const { id } = req.params;
+  const sub = db.prepare("SELECT * FROM submissions WHERE id=?").get(id);
+  if (!sub) return res.status(404).json({ error: "submission 不存在" });
+  if (sub.type !== "mcp") return res.status(400).json({ error: "只有 MCP 有代理 Token" });
+  const token = crypto.randomBytes(16).toString("hex");
+  patchMeta(id, { mcp_token: token });
+  audit(req, "token_rotate", "mcp", id, {});
+  res.json({ ok: true, id });
+});
+
 // 重新同步到 Registry Server（同步失败后重试 / 补发布）。
 // 仅已发布条目可触发；MCP 需先有运行端点，否则会被 registryPublish 标记 skipped:no-endpoint。
 app.post("/submissions/:id/sync", async (req, res) => {
