@@ -1,9 +1,25 @@
 // services/deploy.js —— MCP 部署/下线管线（2026-09-11 渐进式拆分，自 server.js 原样迁出）
 // 职责：tar/镜像/源码三条部署链、幂等清理、端点轮询、重启策略、ingress 收敛、Registry 同步。
 // 依赖经 ctx 注入；extractMcpInspect 由 routes/mcp 提供（lazy 回填与部署共用一份实现）。
+/**
+ * @typedef {Object} DeployCtx 部署服务依赖（由 server.js 装配区注入，Proxy 对账清单见工作日志）
+ * @property {import("better-sqlite3").Database} db
+ * @property {(s: Object) => Object} parseMeta
+ * @property {(id: string, patch: Object) => void} patchMeta
+ * @property {Function} execFileHidden  execFile 包装（隐藏窗口/注入 PATH）
+ * @property {(ms: number) => Promise<void>} sleep
+ * @property {Function} thvListJson  解析 thv list --json
+ * @property {Function} envInjectArgs  env 凭据 → thv run 参数（lib/env-secrets）
+ * @property {Function} buildSourceImage  源码包 → 本地镜像（lib/source-build）
+ * @property {Function} healMcpIngress  建/验固定端口 socat ingress 并回写稳定 endpoint
+ * @property {(imageRef: string) => Promise<Object|null>} extractMcpInspect  镜像元数据提取（脱敏）
+ * @property {Function} runTrivyScan  源码构建部署后的补扫
+ * @property {Function} invalidateMcpRuntimeCaches  部署事件双清 rtCache/toolsCache
+ */
 const fs = require("node:fs");
 const path = require("node:path");
 
+/** @param {DeployCtx} ctx */
 module.exports = function createDeployService(ctx) {
   const {
     db, parseMeta, patchMeta, execFileHidden, MAX_BUFFER, THV_BIN, DOCKER_BIN,
@@ -31,6 +47,7 @@ module.exports = function createDeployService(ctx) {
   }
 
   // 部署一个 MCP：源码构建 / tar 加载 / 镜像直跑三条链，端点轮询 + 收敛 + Registry 同步
+  /** @param {string} id @returns {Promise<void>} 失败时写 meta.deploy_error，不抛出到调用方之外 */
   async function deployMcp(id) {
     invalidateMcpRuntimeCaches(id); // 部署双清 tools/rt 两层缓存（routes/mcp 注入）
     const sub = db.prepare("SELECT * FROM submissions WHERE id=?").get(id);
@@ -184,6 +201,7 @@ module.exports = function createDeployService(ctx) {
   }
 
   // 下线一个 MCP：thv rm 删除容器，清掉 endpoint
+  /** @param {string} id 幂等：条目不存在/非 MCP/sidecar 已清均静默返回 */
   async function undeployMcp(id) {
     invalidateMcpRuntimeCaches(id); // 停止/部署双清 tools/rt 两层缓存（routes/mcp 注入）
     const sub = db.prepare("SELECT * FROM submissions WHERE id=?").get(id);

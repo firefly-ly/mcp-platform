@@ -61,7 +61,9 @@ const INIT = { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVe
     check("4000 回环代理(mode=all 无 token) 200", r.status === 200, "status=" + r.status);
   }
   if (proxyUrl) {
-    r = await req(proxyUrl, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(INIT) });
+    // 对外口测试用 127.0.0.1 固定地址——测试的是"端口语义"而非具体网卡 IP；
+    // public_endpoint 里的 LAN IP 在网络切换后可能已失效（那正是 getLanIp 动态化要解决的场景）
+    r = await req(proxyUrl.replace(/\/\/[^:]+:\d+\//, "//127.0.0.1:4100/"), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(INIT) });
     check("4100 无 token 403（强制校验）", r.status === 403, "status=" + r.status);
     // 当前有效 token 从 DB meta 读取（脚本与本机同源，允许直读）
     let tok = null;
@@ -71,7 +73,8 @@ const INIT = { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVe
       tok = m.mcp_token || null;
     } catch (_) {}
     if (tok) {
-      r = await req(proxyUrl, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${tok}` }, body: JSON.stringify(INIT) });
+      const extUrl = proxyUrl.replace(/\/\/[^:]+:\d+\//, "//127.0.0.1:4100/");
+      r = await req(extUrl, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${tok}` }, body: JSON.stringify(INIT) });
       check("4100 带当前 token 200", r.status === 200, "status=" + r.status);
     }
   }

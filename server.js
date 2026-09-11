@@ -627,6 +627,25 @@ const { healFailState, HEAL_BACKOFF_MS, reconcileMcpWorkloads } = require("./lib
 // 身份由前端 Server 端经 header 注入：x-actor-email / x-actor-groups(逗号分隔) / x-actor-admin。
 // 浏览器不直连本服务，header 由可信的 Next Server 端写入；普通用户无法伪造 session 身份。
 // 安全默认：无身份 header 的调用（外部直连/旧调用方）只能看到 mode=all 的条目。
+
+/**
+ * 请求方身份（由可信 Next Server 端写入的 x-actor-* 头解析而来）。
+ * 注意：本服务只信任回环调用方——对外 4100 口会在入口剥离这些头（见 proxyApp 装配）。
+ * @typedef {Object} Actor
+ * @property {string} email  小写去空格后的邮箱；匿名调用为 ""
+ * @property {string[]} groups  小写分组列表（逗号分隔头展开）
+ * @property {boolean} admin  仅当 x-actor-admin === "1" 时为 true
+ */
+
+/**
+ * 条目可见性配置（meta.visibility 的规范化形态）。
+ * @typedef {Object} Visibility
+ * @property {"all"|"restricted"} mode
+ * @property {string[]} users  小写邮箱白名单（restricted 生效）
+ * @property {string[]} groups  小写分组白名单（restricted 生效）
+ */
+
+/** 从请求头解析调用方身份。绝不校验头本身的可信性——信任边界在「仅回环可达」。 @param {import("express").Request} req @returns {Actor} */
 function actorFromReq(req) {
   const email = String(req.headers["x-actor-email"] || "").toLowerCase().trim();
   const groups = String(req.headers["x-actor-groups"] || "")
@@ -634,7 +653,7 @@ function actorFromReq(req) {
   const admin = String(req.headers["x-actor-admin"] || "") === "1";
   return { email, groups, admin };
 }
-// visibility 缺省视为全员可见（兼容历史数据与未配置条目）
+/** visibility 缺省视为全员可见（兼容历史数据与未配置条目）。 @param {Object} meta @returns {Visibility} */
 function parseVisibility(meta) {
   const v = meta && meta.visibility;
   if (!v || v.mode !== "restricted")
@@ -649,12 +668,16 @@ function parseVisibility(meta) {
       : [],
   };
 }
-// 条目是否已「上线」：仅当管理员显式配置过可见范围后，才对非管理员开放可见/下载/调用。
-// 存量条目无 visibility_configured 字段 → 视为已上线（向后兼容，不强制重配）；
-// 新提交默认 visibility_configured=false → 未上线，仅管理员在「已发布管理」可见，待配可见范围。
+/** 条目是否已「上线」：仅当管理员显式配置过可见范围后，才对非管理员开放可见/下载/调用。
+ *  存量条目无 visibility_configured 字段 → 视为已上线（向后兼容，不强制重配）；
+ *  新提交默认 visibility_configured=false → 未上线，仅管理员在「已发布管理」可见，待配可见范围。
+ *  @param {Object} meta @returns {boolean} */
 function isOnShelf(meta) {
   return !(meta && meta.visibility_configured === false);
 }
+/** 可见性判定单一入口：admin 恒通过 → 未上架拒绝 → mode=all 通过 → restricted 按 users/groups 命中。
+ *  列表过滤、详情、下载、代理调用必须全部走这里，禁止各自内联判定。
+ *  @param {Object} meta @param {Actor|null} actor @returns {boolean} */
 function canAccessSubmission(meta, actor) {
   if (!actor || actor.admin) return true;
   // 未上线的条目只对管理员可见（普通用户/匿名一律不可见不可调用）
@@ -754,14 +777,15 @@ const IS_WSL = (() => {
 })();
 
 // 本机第一个非回环 IPv4（内网地址）。未显式设 PUBLIC_BASE 时用它兜底，
-// 避免对外分发的地址是 127.0.0.1（跨机不可达）。启动时探测一次，开销可忽略。
-const LAN_IP = (() => {
+// 避免对外分发的地址是 127.0.0.1（跨机不可达）。
+// 动态探测（非启动缓存）：笔记本在 WiFi/热点/有线间切换后，复制的接入配置 URL
+// 必须跟随当前网卡，否则生成"看起来像样但谁都连不上"的失效地址。开销微秒级。
+function getLanIp() {
   if (IS_WSL) return null; // WSL 内探测到的必是 NAT 地址，禁用
   try {
     const nets = os.networkInterfaces();
     for (const [ifName, list] of Object.entries(nets)) {
-      // 排除虚拟交换机网卡（WSL/Hyper-V/Docker）——其地址对局域网不可达，
-      // 否则会像 172.20.155.243 那样生成"看起来像样但谁都连不上"的调用 URL
+      // 排除虚拟交换机网卡（WSL/Hyper-V/Docker）——其地址对局域网不可达
       if (/vethernet|wsl|hyper-v|docker|loopback/i.test(ifName)) continue;
       for (const n of list || []) {
         if (n.family === "IPv4" && !n.internal && n.address) return n.address;
@@ -771,7 +795,7 @@ const LAN_IP = (() => {
     /* 取不到就用回环兜底 */
   }
   return null;
-})();
+}
 
 // 对外 MCP 代理监听配置（方案 B 第二口）：仅挂 /mcp-proxy，强制 Token 校验。
 // 端口/绑定可用 PROXY_PORT / PROXY_HOST 覆盖；MCP_PROXY_PUBLIC_DISABLED=1 可整体关闭。
@@ -791,11 +815,12 @@ function publicBase(req) {
       return `${req.protocol}://${host}`;
     }
   }
-  if (LAN_IP) return `http://${LAN_IP}:${PORT}`;
+  const lanIp = getLanIp();
+  if (lanIp) return `http://${lanIp}:${PORT}`;
   return `http://localhost:${PORT}`;
 }
 // 启动时告警一次：回退 localhost 意味着跨机器不可达，提醒部署者显式声明基址
-if (!process.env.PUBLIC_BASE && !LAN_IP) {
+if (!process.env.PUBLIC_BASE && !getLanIp()) {
   console.warn(
     "[publicBase] 未设置 PUBLIC_BASE 且未探测到真实内网 IP：对外地址回退 localhost（仅本机可用）。跨机器访问请设置 PUBLIC_BASE，如 http://<Windows局域网IP>:4000",
   );
@@ -807,10 +832,11 @@ function mcpProxyUrl(name, req) {
   // 复制配置/registry 发布统一指向对外代理口（4100，强制 Token）；
   // 可用 MCP_PROXY_PUBLIC_BASE 显式覆盖（IP 固定的部署建议设置）。
   // 无 LAN_IP 时回退 publicBase(req)（通常 localhost:4000，仅本机可用）。
+  const lanIp = getLanIp();
   const base =
     process.env.MCP_PROXY_PUBLIC_BASE ||
-    (LAN_IP && !process.env.MCP_PROXY_PUBLIC_DISABLED
-      ? `http://${LAN_IP}:${PROXY_PORT}`
+    (lanIp && !process.env.MCP_PROXY_PUBLIC_DISABLED
+      ? `http://${lanIp}:${PROXY_PORT}`
       : null) ||
     publicBase(req);
   return `${base}/mcp-proxy/${encodeURIComponent(name)}/mcp`;
@@ -1281,6 +1307,16 @@ app.use("/mcp-proxy/:name", (req, res) => mcpProxyHandler(req, res, {}));
 // 代理处理器主体（4000 回环口与 4100 对外口共用）。
 // opts.forceToken=true（对外口）：无条件校验 token——对外口上 token 是唯一凭证，
 // mode=all 也不例外（回环口维持原语义：仅 restricted 校验）。
+/**
+ * MCP 代理处理器：token 门禁 → 解析目标实例 → 管道转发。
+ * 安全语义（两个监听口共用此函数，差异仅由 opts.forceToken 表达）：
+ *  - 回环 4000：restricted 条目要求 Bearer/X-MCP-Token/?t= 三来源之一命中 meta.mcp_token；
+ *  - 对外 4100：forceToken=true，所有条目（含 mode=all）一律强制校验，token 是唯一门禁；
+ *  - token 校验先于实例解析——无 token 的 restricted/对外请求在碰 Docker 之前就被 403。
+ * @param {import("express").Request} req
+ * @param {import("express").Response} res
+ * @param {{forceToken?: boolean}} opts
+ */
 async function mcpProxyHandler(req, res, opts = {}) {
   if (req.method === "OPTIONS") return res.sendStatus(204);
 
