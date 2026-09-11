@@ -685,6 +685,7 @@ function canAccessSubmission(meta, actor) {
 
 // 部署一个 MCP：thv run 起容器 → 轮询 list 拿 url → 写回 endpoint
 async function deployMcp(id) {
+  toolsCache?.delete(id); // 部署会变更实例与 tools 清单，主动失效 SWR 缓存
   const sub = db.prepare("SELECT * FROM submissions WHERE id=?").get(id);
   if (!sub || sub.type !== "mcp") return;
   const meta = parseMeta(sub);
@@ -837,6 +838,7 @@ async function deployMcp(id) {
 
 // 下线一个 MCP：thv rm 删除容器，清掉 endpoint
 async function undeployMcp(id) {
+  toolsCache?.delete(id); // 停止实例后 tools 清单失效，主动失效 SWR 缓存
   const sub = db.prepare("SELECT * FROM submissions WHERE id=?").get(id);
   if (!sub || sub.type !== "mcp") return;
   const meta = parseMeta(sub);
@@ -2623,10 +2625,17 @@ app.get("/skills/:id/file", async (req, res) => {
 });
 
 // 真实 MCP 工具清单：按 id 找到运行中实例，调用 tools/list 返回真实能力。
-// 无运行实例或调用失败均优雅降级为 { tools: [], live: false }，不阻塞详情页；
-// 用 8s 超时 Promise.race 防止挂住前端详情页渲染。
-app.get("/mcp/:id/tools", async (req, res) => {
-  const id = req.params.id;
+// 【SWR 缓存层】详情页每点一次都实时握手太慢（秒级），改为三层缓存策略：
+//   fresh（60s 内）→ 直接回缓存；stale（60s 后）→ 立即回旧值 + 后台单飞刷新；
+//   miss → 现场拉取（并发共享单飞）。失败结果做 30s 负缓存，防对挂掉实例的重试风暴。
+//   deploy/undeploy 时主动失效（见 deployMcp/undeployMcp 内 toolsCache.delete）。
+const TOOLS_FRESH_MS = 60_000;
+const TOOLS_FAIL_MS = 30_000;
+const toolsCache = new Map(); // id -> { result, ts, failed }
+const toolsInflight = new Map(); // id -> Promise（单飞锁：同 id 并发共享一次握手）
+
+// 现场拉取（原 handler 主体抽出）：无实例/失败均优雅降级，8s 超时防挂住
+async function fetchToolsLive(id) {
   let s = db.prepare("SELECT * FROM submissions WHERE id=?").get(id);
   let ep = null;
   if (s) {
@@ -2637,34 +2646,63 @@ app.get("/mcp/:id/tools", async (req, res) => {
       if (e && m.id === id) { ep = e; break; }
     }
   }
-  if (!ep) return res.json({ tools: [], live: false });
-  const dbg = req.query.debug === "1" ? {} : null;
+  if (!ep) return { tools: [], live: false };
   const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("tools/list 超时")), 8000));
   try {
-    // 应用自带 API Key 鉴权时自动携带（env 候选逐个尝试），否则工具清单被 401 挡成空列表
-    if (dbg) dbg.candidates = authHeaderCandidates(s ? parseMeta(s) : {}).length;
-    if (dbg && s) {
-      const c0 = authHeaderCandidates(parseMeta(s))[0];
-      dbg.keyFp = c0 ? require("crypto").createHash("sha256").update(c0.Authorization.slice(7)).digest("hex").slice(0, 12) : null;
-      dbg.ep = ep;
-    }
     const r = await Promise.race([mcpCallAuthed(ep, {}, s ? parseMeta(s) : {}), timeout]);
-    if (dbg) { dbg.status = r && r.status; dbg.stage = r && r.stage; dbg.lastEvent = JSON.stringify((r.events && r.events[r.events.length - 1]) || {}).slice(0, 300); }
     const last = (r.events && r.events[r.events.length - 1]) || {};
     const tools = last.result && Array.isArray(last.result.tools) ? last.result.tools : [];
-    return res.json({
+    return {
+      live: true,
       tools: tools.map((t) => ({
         name: t.name,
         description: t.description || "",
         // 前端按 schema 生成参数模板（字段名/类型/必填），剥离后模板会退化成 {}
         ...(t.inputSchema ? { inputSchema: t.inputSchema } : {}),
       })),
-      live: true,
-      ...(dbg ? { debug: dbg } : {}),
-    });
+    };
   } catch (e) {
-    return res.json({ tools: [], live: false, error: String((e && e.message) || e) });
+    return { tools: [], live: false, failed: true, error: String((e && e.message) || e) };
   }
+}
+
+// 单飞执行：同 id 并发共享同一个进行中的刷新，完成后写缓存
+function toolsFetchSingleFlight(id) {
+  let p = toolsInflight.get(id);
+  if (p) return p;
+  p = fetchToolsLive(id)
+    .then((r) => {
+      toolsCache.set(id, { result: r, ts: Date.now(), failed: !r.live });
+      return r;
+    })
+    .catch((e) => {
+      const r = { tools: [], live: false, failed: true, error: String((e && e.message) || e) };
+      toolsCache.set(id, { result: r, ts: Date.now(), failed: true });
+      return r;
+    })
+    .finally(() => toolsInflight.delete(id));
+  toolsInflight.set(id, p);
+  return p;
+}
+
+app.get("/mcp/:id/tools", async (req, res) => {
+  const id = req.params.id;
+  const cached = toolsCache.get(id);
+  if (cached) {
+    const age = Date.now() - cached.ts;
+    const ttl = cached.failed ? TOOLS_FAIL_MS : TOOLS_FRESH_MS;
+    // 过期不阻塞：立即回旧值，后台单飞刷新（已有刷新在跑则不重复发起）
+    if (age > ttl && !toolsInflight.has(id)) toolsFetchSingleFlight(id);
+    return res.json(
+      req.query.debug === "1"
+        ? { ...cached.result, debug: { cached: true, ageMs: age } }
+        : cached.result,
+    );
+  }
+  const r = await toolsFetchSingleFlight(id);
+  return res.json(
+    req.query.debug === "1" ? { ...r, debug: { cached: false } } : r,
+  );
 });
 
 // 真实 MCP 调用：初始化连接 -> 列出工具 / 调用工具，返回真实结果。
