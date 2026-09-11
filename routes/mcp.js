@@ -468,11 +468,13 @@ module.exports = function registerMcpRoutes(app, ctx) {
     res.json({ ok: true, id });
   });
 
-  // 供 server.js 的 deploy/undeploy 在部署事件时双清两层缓存
+  // 供 server.js 的 deploy/undeploy 在部署事件时双清两层缓存；
+  // extractMcpInspect 供 services/deploy 在部署成功后提取镜像元数据（详情页「代码」标签）
   return {
     invalidate(id) {
       toolsCache.delete(id);
       rtCache.delete(id);
     },
+    extractMcpInspect,
   };
 };

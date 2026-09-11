@@ -1512,6 +1512,7 @@ __deployService = require("./services/deploy")({
   ...CTX,
   discoverIngressForSubmission, probeMcpEndpoint, thvListJson, healMcpIngress,
   workloadNameFor, registryPublish, runTrivyScan,
+  envInjectArgs, buildSourceImage, sleep, DOCKER_BIN,
   extractMcpInspect: __mcpRuntime.extractMcpInspect,
   invalidateMcpRuntimeCaches: __mcpRuntime.invalidate,
 });
