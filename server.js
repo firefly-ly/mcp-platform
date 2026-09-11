@@ -954,6 +954,11 @@ const LAN_IP = (() => {
   return null;
 })();
 
+// 对外 MCP 代理监听配置（方案 B 第二口）：仅挂 /mcp-proxy，强制 Token 校验。
+// 端口/绑定可用 PROXY_PORT / PROXY_HOST 覆盖；MCP_PROXY_PUBLIC_DISABLED=1 可整体关闭。
+const PROXY_PORT = Number(process.env.PROXY_PORT || 4100);
+const PROXY_HOST = process.env.PROXY_HOST || "0.0.0.0";
+
 // 平台对外可访问基址：内网部署时建议设置 PUBLIC_BASE（如 http://内网IP:4000），
 // 否则外部 Registry 客户端拿到的下载路由指向 localhost，跨机不可达。
 // 优先级：PUBLIC_BASE > 请求 host（非回环时）> 自动探测的内网 IP > localhost。
@@ -980,7 +985,16 @@ if (!process.env.PUBLIC_BASE && !LAN_IP) {
 // 终端用户访问某个 MCP 的固定入口：走平台后端的反向代理（端口即后端自身端口）。
 // 这样复制给用户的 URL 不随容器重建漂移，也绕开 ingress 只绑 127.0.0.1 的限制。
 function mcpProxyUrl(name, req) {
-  return `${publicBase(req)}/mcp-proxy/${encodeURIComponent(name)}/mcp`;
+  // 复制配置/registry 发布统一指向对外代理口（4100，强制 Token）；
+  // 可用 MCP_PROXY_PUBLIC_BASE 显式覆盖（IP 固定的部署建议设置）。
+  // 无 LAN_IP 时回退 publicBase(req)（通常 localhost:4000，仅本机可用）。
+  const base =
+    process.env.MCP_PROXY_PUBLIC_BASE ||
+    (LAN_IP && !process.env.MCP_PROXY_PUBLIC_DISABLED
+      ? `http://${LAN_IP}:${PROXY_PORT}`
+      : null) ||
+    publicBase(req);
+  return `${base}/mcp-proxy/${encodeURIComponent(name)}/mcp`;
 }
 
 // 是否回环/本机地址。只有这类地址才需要改写为对外地址并绕平台代理；
@@ -1443,12 +1457,14 @@ async function resolveMcpProxyTarget(name) {
 }
 
 // 注意：必须注册在 express.json() 之前，否则请求体已被消费，管道转发会拿到空 body。
-app.use("/mcp-proxy/:name", (req, res) => {
+app.use("/mcp-proxy/:name", (req, res) => mcpProxyHandler(req, res, {}));
+
+// 代理处理器主体（4000 回环口与 4100 对外口共用）。
+// opts.forceToken=true（对外口）：无条件校验 token——对外口上 token 是唯一凭证，
+// mode=all 也不例外（回环口维持原语义：仅 restricted 校验）。
+async function mcpProxyHandler(req, res, opts = {}) {
   if (req.method === "OPTIONS") return res.sendStatus(204);
 
-  // P0-1 修复：restricted 可见性的 MCP 必须携带正确 mcp_token（URL ?t=），
-  // 否则 403 —— 堵住「任何能访问 4000 的人绕过 visibility 直接调用」的洞。
-  // mode=all（含内置 LIVE_MCPS）放行，现有用户复制的配置完全不受影响。
   const name = req.params.name;
   const sid = subIdByWorkload(name) || (String(name).startsWith("sub_") ? name : null);
   let proxyMeta = null;
@@ -1458,7 +1474,8 @@ app.use("/mcp-proxy/:name", (req, res) => {
       const meta = parseMeta(row);
       proxyMeta = meta;
       const v = meta.visibility;
-      if (v && v.mode === "restricted") {
+      const needToken = opts.forceToken || (v && v.mode === "restricted");
+      if (needToken) {
         // token 三来源（按优先级）：Authorization: Bearer / X-MCP-Token 头 / 旧 ?t=（兼容已复制配置）
         const auth = String(req.headers["authorization"] || "");
         const headerToken = auth.startsWith("Bearer ")
@@ -1470,12 +1487,17 @@ app.use("/mcp-proxy/:name", (req, res) => {
         }
         if (!meta.mcp_token || t !== meta.mcp_token) {
           if (deniedThrottled("proxy:" + sid + ":" + (req.socket.remoteAddress || ""))) {
-            audit(req, "proxy_denied", "mcp", sid, { workload: meta.workload_name || "", reason: "restricted without valid token" }, "denied");
+            audit(req, "proxy_denied", "mcp", sid, { workload: meta.workload_name || "", reason: opts.forceToken ? "external without valid token" : "restricted without valid token" }, "denied");
           }
           return res.status(403).json({ error: "forbidden: 该 MCP 仅限授权成员调用（缺少或错误的访问令牌）" });
         }
       }
+    } else if (opts.forceToken) {
+      // 对外口：查无条目（或非 submission 条目）无法验证凭证 → 一律拒绝
+      return res.status(403).json({ error: "forbidden" });
     }
+  } else if (opts.forceToken) {
+    return res.status(403).json({ error: "forbidden" });
   }
 
   resolveMcpProxyTarget(req.params.name)
@@ -1528,7 +1550,7 @@ app.use("/mcp-proxy/:name", (req, res) => {
         res.status(500).json({ error: "代理异常", detail: e.message });
       }
     });
-});
+}
 
 app.use(express.json());
 
@@ -3067,10 +3089,35 @@ app.post("/metrics", (req, res) => {
   res.json({ ok: true });
 });
 
+// ---- 对外 MCP 代理监听（方案 B）：仅挂 /mcp-proxy，强制 Token，与管理 API 物理隔离 ----
+// 该口上：1) x-actor-* 头一律剥离（外部身份不可伪造进审计）；2) token 无条件校验
+// （mode=all 也不例外——对外口上 token 是唯一凭证）；3) 除 /mcp-proxy 外无任何路由。
+// MCP_PROXY_PUBLIC_DISABLED=1 可整体关闭此监听。
+if (process.env.MCP_PROXY_PUBLIC_DISABLED !== "1") {
+  const proxyApp = express();
+  proxyApp.disable("x-powered-by");
+  proxyApp.use("/mcp-proxy/:name", (req, res, next) => {
+    delete req.headers["x-actor-email"];
+    delete req.headers["x-actor-groups"];
+    delete req.headers["x-actor-admin"];
+    next();
+  });
+  proxyApp.use("/mcp-proxy/:name", (req, res) =>
+    mcpProxyHandler(req, res, { forceToken: true }),
+  );
+  proxyApp.listen(PROXY_PORT, PROXY_HOST, () =>
+    console.log(
+      `对外 MCP 代理已监听: ${PROXY_HOST}:${PROXY_PORT}（仅 /mcp-proxy，强制 Token 校验）`,
+    ),
+  );
+}
+
 // 显式绑 0.0.0.0：WSL2 下 localhost 常解析到 127.0.0.1，
 // 若只绑默认的 IPv6 :: 会导致 curl localhost 连接被拒。
 const server = app.listen(PORT, HOST, () =>
-  console.log(`平台后端已启动: http://localhost:${PORT} (${HOST}:${PORT})`)
+  console.log(
+    `平台后端已启动: http://localhost:${PORT} (${HOST}:${PORT})`,
+  ),
 );
 server.on("error", (err) => {
   console.error("监听失败（端口可能被占用或权限不足）:", err);
