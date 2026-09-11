@@ -686,6 +686,7 @@ function canAccessSubmission(meta, actor) {
 // 部署一个 MCP：thv run 起容器 → 轮询 list 拿 url → 写回 endpoint
 async function deployMcp(id) {
   toolsCache?.delete(id); // 部署会变更实例与 tools 清单，主动失效 SWR 缓存
+  rtCache?.delete(id); // 同步失效实例运行时缓存（端点/健康状态）
   const sub = db.prepare("SELECT * FROM submissions WHERE id=?").get(id);
   if (!sub || sub.type !== "mcp") return;
   const meta = parseMeta(sub);
@@ -839,6 +840,7 @@ async function deployMcp(id) {
 // 下线一个 MCP：thv rm 删除容器，清掉 endpoint
 async function undeployMcp(id) {
   toolsCache?.delete(id); // 停止实例后 tools 清单失效，主动失效 SWR 缓存
+  rtCache?.delete(id); // 同步失效实例运行时缓存（端点/健康状态）
   const sub = db.prepare("SELECT * FROM submissions WHERE id=?").get(id);
   if (!sub || sub.type !== "mcp") return;
   const meta = parseMeta(sub);
@@ -2349,14 +2351,26 @@ app.get("/mcp", async (req, res) => {
   const deployed = displayRows
     .filter((s) => parseMeta(s).deploy_status === "deployed")
     .slice(0, 30);
+  // 实例运行时缓存（SWR）：docker 查询 + 探活不再每次全量重做（原先每项 ~450ms）
   const epMap = new Map();
+  const rtMissing = [];
+  for (const s of deployed) {
+    const c = rtCache.get(s.id);
+    if (!c) { rtMissing.push(s); continue; }
+    const age = Date.now() - c.ts;
+    const ttl = c.failed ? RT_FAIL_MS : RT_FRESH_MS;
+    // 过期不阻塞：立即用旧值，后台单飞刷新（失败负缓存过期后暂不采用，等刷新结果）
+    if (age > ttl && !rtInflight.has(s.id)) rtFetchSingleFlight(s.id, s, { rebuild: false });
+    if (!(c.failed && age > RT_FAIL_MS) && c.endpoint) {
+      epMap.set(s.id, { endpoint: c.endpoint, healthy: c.healthy });
+    }
+  }
   await Promise.all(
-    deployed.map(async (s) => {
-      const ep = await discoverIngressForSubmission(s, { rebuild: false });
-      if (!ep) return;
-      // 真实探活：容器被清理、进程崩溃后，discoverIngressForSubmission 会回退到
-      // meta.endpoint 里的陈旧值，不探测就会把不可用的 MCP 展示成可复制配置的状态。
-      epMap.set(s.id, { endpoint: ep, healthy: await probeMcpEndpoint(ep) });
+    rtMissing.map(async (s) => {
+      const r = await rtFetchSingleFlight(s.id, s, { rebuild: false });
+      if (!r.failed && r.endpoint) {
+        epMap.set(s.id, { endpoint: r.endpoint, healthy: r.healthy });
+      }
     }),
   );
   const mcpRows = displayRows.map((s) => {
@@ -2538,11 +2552,19 @@ app.get("/mcp/:id", async (req, res) => {
   // 镜像元数据（懒回填：已部署但未提取过的记录首次访问时补一次）
   Object.assign(row, await ensureMcpInspect(s));
   // 部署时 thv list 报告的内部端口可能不可达；详情页返回前重新动态发现 ingress 端口。
-  const reachableEp = await discoverIngressForSubmission(s);
-  if (reachableEp) row.endpoint = reachableEp;
+  // 实例运行时缓存（SWR）：命中直接用；miss 时 rebuild 默认开启（保留"访问触发自愈"语义）
+  let rt = rtCache.get(s.id);
+  if (!rt) {
+    rt = await rtFetchSingleFlight(s.id, s);
+  } else {
+    const age = Date.now() - rt.ts;
+    const ttl = rt.failed ? RT_FAIL_MS : RT_FRESH_MS;
+    if (age > ttl && !rtInflight.has(s.id)) rtFetchSingleFlight(s.id, s);
+  }
+  if (rt.endpoint) row.endpoint = rt.endpoint;
   // 只有真的跑起来了才给对外地址，否则用户复制过去是个连不通的空壳
   if (row.endpoint) {
-    row.healthy = await probeMcpEndpoint(row.endpoint);
+    row.healthy = rt.healthy;
     if (row.healthy) {
       row.public_endpoint = publicEndpointFor(
         parseMeta(s).workload_name || workloadNameFor(s.id),
@@ -2704,6 +2726,39 @@ app.get("/mcp/:id/tools", async (req, res) => {
     req.query.debug === "1" ? { ...r, debug: { cached: false } } : r,
   );
 });
+
+// ---- 实例运行时缓存（SWR）：ingress 端点发现（docker 查询）+ 真实探活 ----
+// /mcp 列表与 /mcp/:id 每次都对每个实例做 docker 查询 + HTTP 探活（各 ~450ms），
+// 目录页 N 轮版本聚合叠加后严重拖慢导航。策略与 toolsCache 一致：
+//   fresh 60s 直接回缓存；stale 回旧值 + 后台单飞刷新；失败负缓存 30s；
+//   deploy/undeploy 主动失效（与 toolsCache 同点清除）。
+const RT_FRESH_MS = 60_000;
+const RT_FAIL_MS = 30_000;
+const rtCache = new Map(); // id -> { endpoint, healthy, ts, failed }
+const rtInflight = new Map(); // id -> Promise（单飞锁）
+
+// 单飞执行：同 id 并发共享同一次 docker 查询 + 探活，完成后写缓存
+function rtFetchSingleFlight(id, s, opts = {}) {
+  let p = rtInflight.get(id);
+  if (p) return p;
+  p = (async () => {
+    try {
+      const ep = await discoverIngressForSubmission(s, opts);
+      if (!ep) return { endpoint: null, healthy: false, failed: true };
+      const healthy = await probeMcpEndpoint(ep);
+      return { endpoint: ep, healthy, failed: !healthy };
+    } catch (e) {
+      return { endpoint: null, healthy: false, failed: true, error: String((e && e.message) || e) };
+    }
+  })()
+    .then((r) => {
+      rtCache.set(id, { ...r, ts: Date.now() });
+      return r;
+    })
+    .finally(() => rtInflight.delete(id));
+  rtInflight.set(id, p);
+  return p;
+}
 
 // 真实 MCP 调用：初始化连接 -> 列出工具 / 调用工具，返回真实结果。
 // body: { ref?, endpoint?, tool?, args?, actor_id? }
