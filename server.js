@@ -1491,6 +1491,10 @@ require("./routes/skills")(app, {
 // 源码包单文件内容预览的共享实现（MCP 与 Skill 共用）。
 // 安全约束：路径必须存在于文件树中且通过 traversal 校验；敏感文件（.env/密钥/凭据类）拒绝读取；
 // 仅返回文本内容（探测到二进制或超过 256KB 时拒绝），值不落盘、即取即回。
+// 敏感文件不提供内容预览（文件名可列出，内容读取接口会拒绝）。
+// 原随 mcp inspect 常量区定义，mcp 域拆分后此常量被迁走而留守函数仍在引用——
+// 曾导致 /mcp/:id/file 请求同步异常崩溃整个进程（2026-09-11 生产复现），现回归本文件。
+const MCP_SENSITIVE_FILE_RE = /(^|\/)(\.env[^/]*|[^/]*\.(pem|key|p12|pfx|jks|keystore|htpasswd)|id_rsa[^/]*|[^/]*(secret|password|passwd|credential|api[_-]?key)[^/]*)$/i;
 async function servePackageFile(req, res, s) {
   const meta = parseMeta(s);
   // 注意：skill 提交没有 source_type 字段，这里只以 artifact_key 为准

@@ -50,6 +50,15 @@ const INIT = { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVe
     if (t1ms > 100) console.log(`  ℹ tools 首次为实时握手 ${t1ms}ms（SWR 冷启动，正常）`);
     r = await req(`${BASE}/mcp/call`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ref: mcpId }) });
     check("/mcp/call 200", r.status === 200);
+    // 源码包文件预览四分支（曾经因迁移遗漏 MCP_SENSITIVE_FILE_RE 崩溃整个进程，固化护航）
+    const FILE_OK = "flowvision-retail-mcp/Dockerfile";
+    const FILE_SENSITIVE = "flowvision-retail-mcp/.env.mcp.example";
+    r = await req(`${BASE}/mcp/${mcpId}/file?path=${encodeURIComponent(FILE_OK)}`, { headers: { "x-actor-email": "admin@example.com", "x-actor-admin": "1" } });
+    check("/mcp/:id/file 普通文件 200(有内容)", r.status === 200 && r.body && r.body.size > 0, "status=" + r.status);
+    r = await req(`${BASE}/mcp/${mcpId}/file?path=${encodeURIComponent(FILE_SENSITIVE)}`, { headers: { "x-actor-email": "admin@example.com", "x-actor-admin": "1" } });
+    check("/mcp/:id/file 敏感文件 403", r.status === 403, "status=" + r.status);
+    r = await req(`${BASE}/mcp/${mcpId}/file?path=${encodeURIComponent("../../etc/passwd")}`, { headers: { "x-actor-email": "admin@example.com", "x-actor-admin": "1" } });
+    check("/mcp/:id/file 路径穿越 400", r.status === 400, "status=" + r.status);
   }
 
   // 3. 代理：回环 4000（mode=all 免 token）与对外 4100（强制 token，含 mode=all）
