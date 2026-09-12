@@ -1031,70 +1031,9 @@ if (process.env.TRUST_GATEWAY === "1") {
   console.log("[安全] 网关信任模式已开启：除 /health 外所有请求需携带 X-Gateway-Token");
 }
 
-app.post("/upload/tar", (req, res) => {
-  const who = uploadAuthOk(req);
-  if (!who) return res.status(401).json({ error: "upload/tar 需要登录身份（请经平台前端上传）" });
-  if (!uploadAllowed(who)) return res.status(429).json({ error: "上传过于频繁，请稍后再试" });
-  const filename = sanitizeUploadName(req.query.name);
-  const key = stagingKey("mcp", filename);
-  const fp = path.join(TAR_ROOT, key);
-  fs.mkdirSync(path.dirname(fp), { recursive: true });
-  const hash = crypto.createHash("sha256");
-  let size = 0;
-  let aborted = false;
-  const ws = fs.createWriteStream(fp);
-  const fail = (code, msg) => {
-    if (aborted) return;
-    aborted = true;
-    try { ws.destroy(); } catch (_) {}
-    fs.unlink(fp, () => {});
-    if (!res.headersSent) res.status(code).json({ error: msg });
-  };
-  req.on("data", (chunk) => {
-    if (aborted) return;
-    size += chunk.length;
-    if (size > MAX_TAR_UPLOAD_BYTES) {
-      return fail(413, `镜像包体积超过上限 ${MAX_TAR_UPLOAD_MB}MB，请精简镜像或改用 ghcr 地址提交`);
-    }
-    hash.update(chunk);
-    ws.write(chunk, (e) => { if (e) fail(500, "写盘失败: " + e.message); });
-  });
-  req.on("error", (e) => fail(400, "上传中断: " + e.message));
-  ws.on("error", (e) => fail(500, "写盘失败: " + e.message));
-  req.on("end", () => {
-    if (aborted) return;
-    ws.end(async () => {
-      try {
-        const fd = fs.openSync(fp, "r");
-        const head = Buffer.alloc(262);
-        const n = fs.readSync(fd, head, 0, 262, 0);
-        fs.closeSync(fd);
-        const isGzip = head[0] === 0x1f && head[1] === 0x8b;
-        const isTar = n >= 262 && head.toString("ascii", 257, 262) === "ustar";
-        if (!isGzip && !isTar) {
-          return fail(400, "文件不是合法的 docker save 镜像包（需 .tar 或 .tar.gz）");
-        }
-        // 魔数通过还不够：源码压缩包也是合法 tar。docker save 产物在 tar 根目录
-        // 必然包含 manifest.json（或 OCI 的 index.json）与 repositories。缺失即可判定
-        // 不是镜像包，提前在上传阶段拦截，避免到部署时才报「缺少 image_ref」。
-        // 解析失败（超大镜像等）则放行，交由审批后的 docker load 兜底校验。
-        const tf = await tarListFile(fp);
-        if (!tf.err) {
-          const names = tf.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-          const looksLikeImage = names.some((nm) =>
-            /^(manifest\.json|repositories|index\.json|oci-layout)$/.test(nm),
-          );
-          if (!looksLikeImage) {
-            return fail(400, "文件不是合法的 docker save 镜像包（根目录缺少 manifest.json / repositories）。请使用 `docker save 镜像名:tag -o 文件.tar` 导出后上传，不要上传源码或普通压缩包。");
-          }
-        }
-      } catch (e) {
-        return fail(400, "校验失败: " + (e && e.message));
-      }
-      if (!res.headersSent) res.json({ key, sha256: hash.digest("hex"), size });
-    });
-  });
-});
+// POST /upload/tar 已迁至 routes/submissions.js（2026-09-12，上传域归位）。
+// 原留守版调用的 uploadAuthOk/uploadAllowed 已随第四刀迁入该模块，留守版一被访问即
+// ReferenceError 崩溃进程（第六个迁移遗漏，也是唯一漏进生产的）。
 
 // TRUST_GATEWAY=1（生产网关模式）下禁用跨域：API 只接受同源/网关转发，
 // 防止任意网页在浏览器端跨站调用；本地开发保持全开（Next 与 4000 跨端口）。
@@ -1546,6 +1485,7 @@ const __mcpRuntime = require("./routes/mcp")(app, {
   mapMcpRow, publicEndpointFor, mcpAuthHeadersFor, getOrCreateMcpToken,
   authHeaderCandidates, mcpCallAuthed, rewriteForWsl2, resolveEndpoint,
   workloadNameFor, servePackageFile, execFileHidden, MAX_BUFFER,
+  deniedThrottled, // mcp.js 解构引用（当前未使用，补齐防未来误用 undefined）
 });
 // 部署/下线服务：extractMcpInspect 由 routes/mcp 提供（部署成功后的镜像元数据提取）
 __deployService = require("./services/deploy")({
@@ -1613,7 +1553,7 @@ require("./routes/submissions")(app, {
   deniedThrottled, runSubmissionScans, deleteSubmissionSecrets, storeSubmissionEnv,
   deployMcp: __deployService.deployMcp, undeployMcp: __deployService.undeployMcp,
   RATE_WINDOW_MS, RATE_MAX, DUP_STATUSES, INTERNAL_PROXY_TOKEN,
-  MCP_TREE_MAX, MAX_BUFFER,
+  MCP_TREE_MAX, MAX_BUFFER, MAX_TAR_UPLOAD_MB, MAX_TAR_UPLOAD_BYTES,
 });
 
 // 显式绑 0.0.0.0：WSL2 下 localhost 常解析到 127.0.0.1，

@@ -59,6 +59,11 @@ const INIT = { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVe
     check("/mcp/:id/file 敏感文件 403", r.status === 403, "status=" + r.status);
     r = await req(`${BASE}/mcp/${mcpId}/file?path=${encodeURIComponent("../../etc/passwd")}`, { headers: { "x-actor-email": "admin@example.com", "x-actor-admin": "1" } });
     check("/mcp/:id/file 路径穿越 400", r.status === 400, "status=" + r.status);
+    // /upload/tar 三分支（曾因留守版引用已迁走的 uploadAuthOk 崩溃进程，固化护航）
+    r = await req(`${BASE}/upload/tar?name=t.tar`, { method: "POST", body: "x" });
+    check("/upload/tar 无身份 401", r.status === 401, "status=" + r.status);
+    r = await req(`${BASE}/upload/tar?name=t.tar`, { method: "POST", headers: { "x-actor-email": "smoke@example.com" }, body: "not-a-tar" });
+    check("/upload/tar 假数据 400（魔数校验）", r.status === 400, "status=" + r.status);
   }
 
   // 3. 代理：回环 4000（mode=all 免 token）与对外 4100（强制 token，含 mode=all）

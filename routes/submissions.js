@@ -5,6 +5,8 @@
 // 因为其依赖的常量（RATE_* / DUP_STATUSES / MCP_TREE_MAX / MCP_README_INSPECT_VERSION 等）
 // 声明位置靠后，const 无提升——延迟到文件末尾装配可规避 TDZ。
 const path = require("node:path");
+const fs = require("node:fs");
+const crypto = require("node:crypto");
 const express = require("express");
 
 // README/文件树提取规则版本号（与 routes/mcp.js 各自独立持有一份，语义一致）
@@ -21,7 +23,7 @@ module.exports = function registerSubmissionsRoutes(app, ctx) {
     validateSkillPackage, inspectSkillPackage,
     INTERNAL_PROXY_TOKEN, INTERNAL_REGISTRY, INTERNAL_ONLY, TRUSTED_REGISTRIES,
     RATE_WINDOW_MS, RATE_MAX, DUP_STATUSES, MAX_BUFFER,
-    MCP_TREE_MAX,
+    MCP_TREE_MAX, tarListFile, MAX_TAR_UPLOAD_MB, MAX_TAR_UPLOAD_BYTES,
     // 注意：MCP_README_INSPECT_VERSION 不从 ctx 解构——模块顶层已有同名 const(=3)，
     // 若在此解构会以 undefined 遮蔽它，破坏 README 懒回填的版本判断。
   } = ctx;
@@ -57,6 +59,74 @@ module.exports = function registerSubmissionsRoutes(app, ctx) {
     if (actor.email) return actor.email;
     return null;
   }
+
+  // 接收 docker save 镜像包（.tar/.tar.gz），流式落盘 staging 并校验魔数与 manifest。
+  // 2026-09-12 自 server.js 迁入（原留守在 server.js 但调用的 uploadAuthOk/uploadAllowed
+  // 已随第四刀迁至本模块 → 任何对该路由的访问都会 ReferenceError 崩溃进程）。
+  app.post("/upload/tar", (req, res) => {
+    const who = uploadAuthOk(req);
+    if (!who) return res.status(401).json({ error: "upload/tar 需要登录身份（请经平台前端上传）" });
+    if (!uploadAllowed(who)) return res.status(429).json({ error: "上传过于频繁，请稍后再试" });
+    const filename = sanitizeUploadName(req.query.name);
+    const key = stagingKey("mcp", filename);
+    const fp = path.join(ctx.TAR_ROOT, key);
+    fs.mkdirSync(path.dirname(fp), { recursive: true });
+    const hash = crypto.createHash("sha256");
+    let size = 0;
+    let aborted = false;
+    const ws = fs.createWriteStream(fp);
+    const fail = (code, msg) => {
+      if (aborted) return;
+      aborted = true;
+      try { ws.destroy(); } catch (_) {}
+      fs.unlink(fp, () => {});
+      if (!res.headersSent) res.status(code).json({ error: msg });
+    };
+    req.on("data", (chunk) => {
+      if (aborted) return;
+      size += chunk.length;
+      if (size > MAX_TAR_UPLOAD_BYTES) {
+        return fail(413, `镜像包体积超过上限 ${MAX_TAR_UPLOAD_MB}MB，请精简镜像或改用 ghcr 地址提交`);
+      }
+      hash.update(chunk);
+      ws.write(chunk, (e) => { if (e) fail(500, "写盘失败: " + e.message); });
+    });
+    req.on("error", (e) => fail(400, "上传中断: " + e.message));
+    ws.on("error", (e) => fail(500, "写盘失败: " + e.message));
+    req.on("end", () => {
+      if (aborted) return;
+      ws.end(async () => {
+        try {
+          const fd = fs.openSync(fp, "r");
+          const head = Buffer.alloc(262);
+          const n = fs.readSync(fd, head, 0, 262, 0);
+          fs.closeSync(fd);
+          const isGzip = head[0] === 0x1f && head[1] === 0x8b;
+          const isTar = n >= 262 && head.toString("ascii", 257, 262) === "ustar";
+          if (!isGzip && !isTar) {
+            return fail(400, "文件不是合法的 docker save 镜像包（需 .tar 或 .tar.gz）");
+          }
+          // 魔数通过还不够：源码压缩包也是合法 tar。docker save 产物在 tar 根目录
+          // 必然包含 manifest.json（或 OCI 的 index.json）与 repositories。缺失即可判定
+          // 不是镜像包，提前在上传阶段拦截，避免到部署时才报「缺少 image_ref」。
+          // 解析失败（超大镜像等）则放行，交由审批后的 docker load 兜底校验。
+          const tf = await tarListFile(fp);
+          if (!tf.err) {
+            const names = tf.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+            const looksLikeImage = names.some((nm) =>
+              /^(manifest\.json|repositories|index\.json|oci-layout)$/.test(nm),
+            );
+            if (!looksLikeImage) {
+              return fail(400, "文件不是合法的 docker save 镜像包（根目录缺少 manifest.json / repositories）。请使用 `docker save 镜像名:tag -o 文件.tar` 导出后上传，不要上传源码或普通压缩包。");
+            }
+          }
+        } catch (e) {
+          return fail(400, "校验失败: " + (e && e.message));
+        }
+        if (!res.headersSent) res.json({ key, sha256: hash.digest("hex"), size });
+      });
+    });
+  });
 
   // 接收原始二进制（Skill 包 .tar.gz），落入 ObjectStore，返回内部 key + sha256。
   // 制品来源 = 提交者本人，平台存盘后生成 artifact_key 交回前端，提交时写入 meta。
