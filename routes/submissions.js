@@ -13,7 +13,7 @@ const MCP_README_INSPECT_VERSION = 3;
 module.exports = function registerSubmissionsRoutes(app, ctx) {
   const {
     db, parseMeta, patchMeta, actorFromReq, audit, deniedThrottled,
-    objStore, stagingKey, sanitizeUploadName, promoteArtifact,
+    objStore, stagingKey, sanitizeUploadName, normName, promoteArtifact,
     ensureGroupMeta, ensureRegistryMeta, registryDelete, registryPublish,
     listGroupVersions, classifyRegistry, runSubmissionScans,
     deleteSubmissionSecrets, storeSubmissionEnv, undeployMcp, deployMcp,
@@ -21,7 +21,9 @@ module.exports = function registerSubmissionsRoutes(app, ctx) {
     validateSkillPackage, inspectSkillPackage,
     INTERNAL_PROXY_TOKEN, INTERNAL_REGISTRY, INTERNAL_ONLY, TRUSTED_REGISTRIES,
     RATE_WINDOW_MS, RATE_MAX, DUP_STATUSES, MAX_BUFFER,
-    MCP_TREE_MAX, MCP_README_INSPECT_VERSION,
+    MCP_TREE_MAX,
+    // 注意：MCP_README_INSPECT_VERSION 不从 ctx 解构——模块顶层已有同名 const(=3)，
+    // 若在此解构会以 undefined 遮蔽它，破坏 README 懒回填的版本判断。
   } = ctx;
 
   // ---- 上传防滥用（身份 + 限流 + 体积上限）----
