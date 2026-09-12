@@ -195,11 +195,15 @@ module.exports = function registerSubmissionsRoutes(app, ctx) {
       const actor = actorFromReq(req);
       const user_id = String(actor.email || who || "anonymous");
       const name = String(req.query.display_name || filename.replace(/\.(zip|tar\.gz|tgz)$/i, "")).slice(0, 80);
-      const version = String(req.query.version || "1.0.0");
+      // 版本与产品引用：用户表单填了 payload_ref（产品名:版本号）就以其为准；
+      // version 缺省时不写死 1.0.0——交由 ensureGroupMeta 从 payload_ref 自动提取
+      // （此前前端把空 version 兜底成 "1.0.0" 传入，导致引用里的 :2.0.2 永远不被识别）。
+      const userRef = String(req.query.payload_ref || "").trim();
+      const version = String(req.query.version || "").trim();
       const id = "sub_" + Date.now();
       const meta = {
         name,
-        version,
+        ...(version ? { version } : {}),
         source_type: "source",
         artifact_key: key,
         artifact_filename: filename,
@@ -207,9 +211,12 @@ module.exports = function registerSubmissionsRoutes(app, ctx) {
         visibility_configured: false,
       };
       const metaJson = JSON.stringify(meta);
+      // payload_ref：用户表单填的产品引用（产品名:版本号）优先；未填则回落 zip 文件名
+      // （剥掉压缩包扩展名，避免版本提取吃到 ".zip" 尾巴）
+      const finalRef = userRef || filename.replace(/\.(zip|tar\.gz|tgz)$/i, "");
       db.prepare(`INSERT INTO submissions VALUES(?,?,?,?,?,?,?,?)`)
-        .run(id, user_id, "mcp", filename, "pending", "pending", new Date().toISOString(), metaJson);
-      ensureGroupMeta({ id, payload_ref: filename, meta: metaJson });
+        .run(id, user_id, "mcp", finalRef, "pending", "pending", new Date().toISOString(), metaJson);
+      ensureGroupMeta({ id, payload_ref: finalRef, meta: metaJson });
       runSubmissionScans(id, "mcp");
       audit(req, "submit", "mcp-source", id, { filename, size: req.body.length });
       res.json({ id, status: "pending" });
