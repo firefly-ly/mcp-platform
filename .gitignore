@@ -29,6 +29,7 @@ __pycache__/
 *.bak
 *~
 _t_*.js
+tmp-*.js
 
 # ===== 系统 =====
 Thumbs.db

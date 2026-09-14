@@ -78,7 +78,7 @@ module.exports = function registerSubmissionsRoutes(app, ctx) {
     const fail = (code, msg) => {
       if (aborted) return;
       aborted = true;
-      try { ws.destroy(); } catch (_) {}
+      try { ws.destroy(); } catch (_) {} // 上传中止后 ws 可能已断开，destroy 幂等
       fs.unlink(fp, () => {});
       if (!res.headersSent) res.status(code).json({ error: msg });
     };
@@ -309,7 +309,7 @@ module.exports = function registerSubmissionsRoutes(app, ctx) {
       }
       const validation = await validateSkillPackage(m.artifact_key);
       if (!validation.valid) {
-        try { await objStore.del(m.artifact_key); } catch (_) {}
+        try { await objStore.del(m.artifact_key); } catch (_) {} // 制品可能已不存在，清理失败不掩盖校验失败的主错误
         return res.status(400).json({ error: "Skill 包不合规：" + validation.error });
       }
       // 以 SKILL.md 中的 name/description 为权威来源，覆盖表单输入，避免不一致

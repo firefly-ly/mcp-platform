@@ -74,13 +74,13 @@ db.exec(`
   );
 `);
 // 兼容已存在的旧库（早期没有 meta 列）
-try { db.exec("ALTER TABLE submissions ADD COLUMN meta TEXT;"); } catch (_) {}
+try { db.exec("ALTER TABLE submissions ADD COLUMN meta TEXT;"); } catch (_) {} // 列已存在 = 已迁移，幂等忽略
 
 // metric_events 查询索引：列表页逐条 COUNT、stats 全表 GROUP BY 都按 (item_type, event, item_ref) 过滤，
 // 无索引时随表膨胀线性变慢；occurred_at 纳入索引同时加速时间窗清理与日报表。
 try {
   db.exec("CREATE INDEX IF NOT EXISTS idx_metric_events_lookup ON metric_events(item_type, event, item_ref, occurred_at);");
-} catch (_) {}
+} catch (_) {} // 索引已存在或旧库结构不满足时忽略，不阻断启动
 
 // 统一审计轨迹（2.4.4）：治理动作全量记录，只增不删改（代码中不存在本表的 UPDATE/DELETE）。
 // 记录七要素：谁(ts/actor)、做了什么(action)、对什么(target)、怎么做的(detail)、结果(result)。
@@ -91,7 +91,7 @@ try {
     action TEXT, target_type TEXT, target_id TEXT, detail TEXT, result TEXT
   )`);
   db.exec("CREATE INDEX IF NOT EXISTS idx_audit_lookup ON audit_logs(action, target_type, target_id, ts);");
-} catch (_) {}
+} catch (_) {} // 同上：audit 索引创建失败不阻断启动
 
 // 首次运行种子：已审批的 demo skill + demo mcp + 一些 demo 指标事件
 function seedIfEmpty() {
@@ -149,7 +149,7 @@ seedIfEmpty();
 // 把 submissions 行映射为对外暴露的 MCP/Skill 视图对象
 function mapMcpRow(s, callMap, favMap) {
   let meta = {};
-  try { meta = s.meta ? JSON.parse(s.meta) : {}; } catch (_) {}
+  try { meta = s.meta ? JSON.parse(s.meta) : {}; } catch (_) {} // meta 损坏时按空对象兜底，不让单条坏数据拖垮列表渲染
   return {
     id: s.id,
     item_ref: s.id,
@@ -297,7 +297,7 @@ async function parseSSE(body) {
       buf = buf.slice(idx + 2);
       const dataLine = chunk.split("\n").find((l) => l.startsWith("data:"));
       if (dataLine) {
-        try { events.push(JSON.parse(dataLine.slice(5).trim())); } catch (_) {}
+        try { events.push(JSON.parse(dataLine.slice(5).trim())); } catch (_) {} // SSE data 行为心跳/注释等非 JSON 内容时跳过
       }
     }
   };
@@ -716,7 +716,7 @@ function registryUrl() {
       if (winIp && !winIp.startsWith("127.")) {
         u = u.replace(/^(https?:\/\/)127\.0\.0\.1(:\d+)?/, `$1${winIp}$2`);
       }
-    } catch (_) {}
+    } catch (_) {} // URL 重写尽力而为：winIp 不可用时保留原地址
   }
   return u;
 }
@@ -1150,7 +1150,7 @@ async function rebuildIngress(workload, cur) {
   for (let off = 0; off < 5; off++) {
     const hostPort = stablePortFor(workload, off * 37);
     // 清理同名旧容器（无论它是 thv 的动态 squid 还是坏死的 socat）——统一收敛到固定端口
-    try { await execFileHidden("docker", ["rm", "-f", ingressName], { timeout: 15000, maxBuffer: MAX_BUFFER }); } catch (_) {}
+    try { await execFileHidden("docker", ["rm", "-f", ingressName], { timeout: 15000, maxBuffer: MAX_BUFFER }); } catch (_) {} // 容器可能本就不存在，rm 失败不影响后续重建
     try {
       await execFileHidden(
         "docker", ["run", "-d", "--restart", "unless-stopped", "--name", ingressName, "--network", extNet,
@@ -1277,7 +1277,7 @@ async function mcpProxyHandler(req, res, opts = {}) {
           : String(req.headers["x-mcp-token"] || "").trim();
         let t = headerToken || null;
         if (!t) {
-          try { t = new URL(req.url, "http://x").searchParams.get("t"); } catch (_) {}
+          try { t = new URL(req.url, "http://x").searchParams.get("t"); } catch (_) {} // URL 解析失败保持 t=null，由后续校验统一 403
         }
         if (!meta.mcp_token || t !== meta.mcp_token) {
           if (deniedThrottled("proxy:" + sid + ":" + (req.socket.remoteAddress || ""))) {
@@ -1452,7 +1452,7 @@ async function servePackageFile(req, res, s) {
     return res.status(404).json({ error: "文件不在源码包内" });
   }
   let obj;
-  try { obj = await objStore.get(meta.artifact_key); } catch (_) {}
+  try { obj = await objStore.get(meta.artifact_key); } catch (_) {} // 制品可能已被清理（removed/回填缺失），下方 404 兜底
   if (!obj || !obj.buffer) return res.status(404).json({ error: "源码包不存在或已清理" });
   const pkg = await openSkillPackage(obj.buffer, String(meta.artifact_key).toLowerCase());
   if (pkg.error) return res.status(500).json({ error: "源码包解压失败" });
@@ -1697,7 +1697,7 @@ setInterval(runDailyMaintenance, 24 * 3600 * 1000).unref();
 function shutdown(signal) {
   console.log(`收到 ${signal}，正在优雅关闭...`);
   server.close(() => {
-    try { db.close(); } catch (_) {}
+    try { db.close(); } catch (_) {} // 优雅关闭路径 DB 可能已关闭，二次 close 报错无需处理
     process.exit(0);
   });
   // 兜底：5s 内未关完则强退
