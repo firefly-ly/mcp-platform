@@ -1480,6 +1480,7 @@ async function servePackageFile(req, res, s) {
 const __mcpRuntime = require("./routes/mcp")(app, {
   ...CTX,
   canAccessSubmission, pickDisplayVersions, isOnShelf, LIVE_MCPS,
+  MCP_TREE_MAX,
   discoverIngressForSubmission, probeMcpEndpoint, discoverThvEndpoint,
   resolveMcpProxyTarget, subIdByWorkload, healMcpIngress,
   mapMcpRow, publicEndpointFor, mcpAuthHeadersFor, getOrCreateMcpToken,

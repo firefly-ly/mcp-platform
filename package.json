@@ -5,11 +5,20 @@
   "description": "MCP+Skill 平台自建后端最小骨架（方案3）",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "lint": "eslint .",
+    "check:split": "node scripts/check-split-integrity.js",
+    "test:smoke": "node scripts/smoke-test.js",
+    "test:security": "node scripts/security-test.js"
   },
   "dependencies": {
-    "cors": "^2.8.5",
     "better-sqlite3": "^11.3.0",
+    "cors": "^2.8.5",
     "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.10.0",
+    "globals": "^17.12.0"
   }
 }

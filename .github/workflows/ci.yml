@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  static:
+    name: 静态检查（语法 / 拆分对账 / lint）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: 语法检查（全部 JS）
+        run: |
+          fail=0
+          for f in $(git ls-files '*.js'); do node --check "$f" || fail=1; done
+          exit $fail
+      - name: 拆分对账（8 模块 Proxy 对账）
+        run: node scripts/check-split-integrity.js
+      - name: ESLint
+        run: npm run lint
+
+  smoke:
+    name: 冒烟测试（空库启动 + 种子 + 全接口）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: 启动后端
+        run: |
+          node server.js &
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:4000/health && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:4000/health > /dev/null
+      - name: 注入种子数据（可下载 Skill）
+        run: node scripts/ci-seed.js
+      - name: 全接口冒烟
+        run: node scripts/smoke-test.js

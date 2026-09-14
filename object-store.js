@@ -61,7 +61,8 @@ function mc() {
     Minio = require("minio");
   } catch (e) {
     throw new Error(
-      "OBJECT_STORE=minio 但未安装 minio SDK，请 `npm install minio` 或改回 OBJECT_STORE=fs"
+      "OBJECT_STORE=minio 但未安装 minio SDK，请 `npm install minio` 或改回 OBJECT_STORE=fs",
+      { cause: e },
     );
   }
   _mc = new Minio.Client({

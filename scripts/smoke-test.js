@@ -137,7 +137,7 @@ const INIT = { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVe
   r = await req(`${BASE}/registry/classify?ref=ghcr.io/stackloklabs/osv`);
   check("/registry/classify 200", r.status === 200);
   const skillId = skill ? skill.id : "sub_1788423526647";
-  r = await req(`${BASE}/groups/hello-report/versions`).catch(() => null);
+  await req(`${BASE}/groups/hello-report/versions`).catch(() => null); // 预热（结果不使用）
   r = await req(`${BASE}/submissions/nonexistent/env`, { headers: ADMIN });
   check("/submissions/:id/env 404（不存在 id）", r.status === 404, "status=" + r.status);
 

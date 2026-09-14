@@ -17,6 +17,7 @@ module.exports = function registerMcpRoutes(app, ctx) {
     mapMcpRow, publicEndpointFor, mcpAuthHeadersFor, getOrCreateMcpToken,
     authHeaderCandidates, mcpCallAuthed, rewriteForWsl2, resolveEndpoint,
     workloadNameFor, servePackageFile, execFileHidden, MAX_BUFFER,
+    inspectSkillPackage, MCP_TREE_MAX,
   } = ctx;
 
   // ---- 实例运行时缓存（SWR）：ingress 端点发现（docker 查询）+ 真实探活 ----
