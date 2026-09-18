@@ -1,9 +1,12 @@
-// MCP + Skill 平台 · 自建后端最小骨架（方案3）
+// MCP + Skill 平台 · 自建后端业务中枢
 // 技术栈：Node + Express + better-sqlite3 + cors
-// 说明：这是"上传/审批/收藏/监控"业务中枢的本地可跑最小版本。
-//       生产需补：Casdoor OIDC 回调拿用户/角色、文件上传到对象存储、
-//       Trivy 扫描、审批通过调 Registry Admin API 写目录 + 推 Harbor/Git、
-//       Prometheus 接 Gateway 调用量（见 runbook 阶段10 警告）。
+// 结构：lib/（构建/扫描/对账/凭据等）+ routes/（路由域）+ services/（部署管线），
+//       依赖经 CTX 注入装配；scripts/ 下有对账、冒烟、安全测试等护航脚本。
+// 已落地：对象存储抽象（fs/MinIO）、Trivy 扫描 + 提示词注入检测、统一审计轨迹、
+//         Registry 同步、源码包自动构建、.env 凭据库注入、上传防滥用与来源分级。
+// 鉴权：用户会话由前端 cloud-ui 经 Casdoor OIDC 建立；后端对内信任内部令牌
+//       （x-internal-proxy），对外 4100 端口强制 Token。
+// 仍规划中：Cedar call-time 细粒度授权、制品推 Harbor/Git、Prometheus 接入调用量。
 
 const express = require("express");
 const cors = require("cors");
