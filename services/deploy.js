@@ -64,7 +64,27 @@ module.exports = function createDeployService(ctx) {
 
   // 部署一个 MCP：源码构建 / tar 加载 / 镜像直跑三条链，端点轮询 + 收敛 + Registry 同步
   /** @param {string} id @returns {Promise<void>} 失败时写 meta.deploy_error，不抛出到调用方之外 */
-  async function deployMcp(id) {
+  // —— 部署并发锁 ——
+  // 同一 submission 的部署/下线/删除互斥：并发时「一个在 docker start、一个在 thv rm」
+  // 会产生半死容器组。Node 单进程内存锁即可（全部入口共用同一个 service 实例），
+  // 进程重启自动清零。锁被占抛 code=DEPLOY_BUSY，路由层转 409；reconcile 自愈侧
+  // 本就有 try/catch，busy 会跳过本轮、下轮重试。
+  const deployLocks = new Set();
+  async function withDeployLock(id, fn) {
+    if (deployLocks.has(id)) {
+      const err = new Error("该 MCP 正在部署/下线中，请等待当前操作完成后再试");
+      err.code = "DEPLOY_BUSY";
+      throw err;
+    }
+    deployLocks.add(id);
+    try {
+      return await fn();
+    } finally {
+      deployLocks.delete(id);
+    }
+  }
+
+  async function deployMcpInner(id) {
     invalidateMcpRuntimeCaches(id); // 部署双清 tools/rt 两层缓存（routes/mcp 注入）
     const sub = db.prepare("SELECT * FROM submissions WHERE id=?").get(id);
     if (!sub || sub.type !== "mcp") return;
@@ -270,7 +290,7 @@ module.exports = function createDeployService(ctx) {
 
   // 下线一个 MCP：thv rm 删除容器，清掉 endpoint
   /** @param {string} id 幂等：条目不存在/非 MCP/sidecar 已清均静默返回 */
-  async function undeployMcp(id, opts = {}) {
+  async function undeployMcpInner(id, opts = {}) {
     invalidateMcpRuntimeCaches(id); // 停止/部署双清 tools/rt 两层缓存（routes/mcp 注入）
     const sub = db.prepare("SELECT * FROM submissions WHERE id=?").get(id);
     if (!sub || sub.type !== "mcp") return;
@@ -303,5 +323,9 @@ module.exports = function createDeployService(ctx) {
     // 注：下线只停容器 + 清运行态，Registry 目录条目保留（按设计：仅「删除」才从 Registry 摘除）。
   }
 
-  return { deployMcp, undeployMcp };
+  // 导出层统一包锁：部署/下线路由、删除提交、reconcile 自愈全部互斥
+  return {
+    deployMcp: (id) => withDeployLock(id, () => deployMcpInner(id)),
+    undeployMcp: (id, opts = {}) => withDeployLock(id, () => undeployMcpInner(id, opts)),
+  };
 };

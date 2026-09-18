@@ -539,7 +539,13 @@ module.exports = function registerSubmissionsRoutes(app, ctx) {
         error: "该 MCP 尚未上线：请先在「可见范围」里选择可查看/调用它的成员或组并保存，之后才能部署。",
       });
     }
-    await deployMcp(id);
+    try {
+      await deployMcp(id);
+    } catch (e) {
+      // DEPLOY_BUSY：同一 MCP 已有部署/下线在进行，拒绝并发触发（前端提示稍后再试）
+      if (e && e.code === "DEPLOY_BUSY") return res.status(409).json({ id, error: e.message });
+      return res.status(500).json({ id, error: "部署触发失败: " + (e && e.message) });
+    }
     const m = parseMeta(db.prepare("SELECT meta FROM submissions WHERE id=?").get(id));
     audit(req, "deploy", sub.type, id, { workload: m.workload_name, deploy_status: m.deploy_status, deploy_error: m.deploy_error || "", image: m.deployed_image || "" }, m.deploy_status === "failed" ? "error" : "success");
     if (m.deploy_status === "failed") {
@@ -554,7 +560,12 @@ module.exports = function registerSubmissionsRoutes(app, ctx) {
     const sub = db.prepare("SELECT * FROM submissions WHERE id=?").get(id);
     if (!sub) return res.status(404).json({ error: "submission 不存在" });
     if (sub.type !== "mcp") return res.status(400).json({ error: "只有 MCP 可下线" });
-    await undeployMcp(id);
+    try {
+      await undeployMcp(id);
+    } catch (e) {
+      if (e && e.code === "DEPLOY_BUSY") return res.status(409).json({ id, error: e.message });
+      return res.status(500).json({ id, error: "下线触发失败: " + (e && e.message) });
+    }
     audit(req, "undeploy", sub.type, id, {});
     res.json({ id, deploy_status: "undeployed" });
   });
@@ -645,6 +656,11 @@ module.exports = function registerSubmissionsRoutes(app, ctx) {
       try {
         await undeployMcp(id, { hard: true });
       } catch (e) {
+        if (e && e.code === "DEPLOY_BUSY") {
+          // 删除撞上部署/下线进行中：回滚刚写的状态（审批流水保留作痕迹），409 让管理员稍后重删
+          db.prepare("UPDATE submissions SET status=? WHERE id=?").run(sub.status, id);
+          return res.status(409).json({ id, error: "该 MCP 正在部署/下线中，请等待当前操作完成后再删除" });
+        }
         console.error("[lifecycle] 删除时停止实例失败:", id, e && e.message);
       }
     }
