@@ -1495,6 +1495,7 @@ const __mcpRuntime = require("./routes/mcp")(app, {
 __deployService = require("./services/deploy")({
   ...CTX,
   discoverIngressForSubmission, probeMcpEndpoint, thvListJson, healMcpIngress,
+  ensureStableIngress, // 快启路径原地恢复后重建固定端口 ingress 并探活（2026-09-18 下线语义改造）
   workloadNameFor, registryPublish, runTrivyScan,
   envInjectArgs, buildSourceImage, sleep, DOCKER_BIN,
   extractMcpInspect: __mcpRuntime.extractMcpInspect,

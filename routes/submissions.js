@@ -640,9 +640,10 @@ module.exports = function registerSubmissionsRoutes(app, ctx) {
 
     // 「删除(removed)」：停容器 + 清端点 + 从 Registry 移除 + 清理制品
     // 兜底：单步失败不阻断，保证接口最终能给出响应（否则前端拿不到结果会白屏）
+    // hard:true —— 删除提交必须 thv rm 整组移除（下线语义的 stop 会留下已停容器成为孤儿）
     if (status === "removed" && sub.type === "mcp") {
       try {
-        await undeployMcp(id);
+        await undeployMcp(id, { hard: true });
       } catch (e) {
         console.error("[lifecycle] 删除时停止实例失败:", id, e && e.message);
       }

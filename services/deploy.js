@@ -18,6 +18,7 @@
  */
 const fs = require("node:fs");
 const path = require("node:path");
+const crypto = require("node:crypto");
 
 /** @param {DeployCtx} ctx */
 module.exports = function createDeployService(ctx) {
@@ -25,6 +26,7 @@ module.exports = function createDeployService(ctx) {
     db, parseMeta, patchMeta, execFileHidden, MAX_BUFFER, THV_BIN, DOCKER_BIN,
     envInjectArgs, buildSourceImage, thvListJson, sleep, workloadNameFor,
     registryPublish, healMcpIngress, extractMcpInspect, runTrivyScan,
+    ensureStableIngress, probeMcpEndpoint,
     invalidateMcpRuntimeCaches,
   } = ctx;
 
@@ -44,6 +46,20 @@ module.exports = function createDeployService(ctx) {
       return tag;
     }
     return null;
+  }
+
+  // 部署配置指纹：镜像 + env 注入参数 + 传输形态的稳定哈希。
+  // 指纹一致 ⇒ thv start 恢复的旧运行配置与本次期望完全一致，可安全走秒级快启；
+  // 注意它锁定的是「配置字符串」——镜像 tag 被原地覆盖同名校验不到（内部镜像约定不可变 tag），
+  // 这类场景请删除提交重新走完整链。
+  function deployFingerprint(image, meta) {
+    const args = envInjectArgs(meta);
+    const norm = JSON.stringify({
+      image, args,
+      transport: meta.transport || "",
+      source_type: meta.source_type || "",
+    });
+    return crypto.createHash("sha256").update(norm).digest("hex").slice(0, 16);
   }
 
   // 部署一个 MCP：源码构建 / tar 加载 / 镜像直跑三条链，端点轮询 + 收敛 + Registry 同步
@@ -112,7 +128,33 @@ module.exports = function createDeployService(ctx) {
     patchMeta(id, { deployed_image: image, deployed_from_internal: Boolean(meta.internal_ref) });
     const workload = meta.workload_name || workloadNameFor(id);
     patchMeta(id, { deploy_status: "deploying", workload_name: workload, deploy_error: "" });
-    try {
+    // 快启路径（2026-09-18 下线语义改造的另一半）：下线只 thv stop 不删容器，容器原地保留（Exited）。
+    // 检测「配置指纹一致 + 存在已停止容器」直接 docker start 原地恢复（实测 ~3s），
+    // 跳过 rm+run 完整重建，也绕开 thv start 的副作用——它会重新 pull sidecar 镜像
+    //（docker.io 不稳时卡死数分钟，这正是「重新部署很久」的根因）。
+    // 门禁：① meta.deploy_fp 与当前指纹一致（镜像/env 注入/传输均未变）；
+    //      ② source 构建不快启——重建后镜像名字符串不变、指纹感知不到代码变更，必须走完整链。
+    const deployFp = deployFingerprint(image, meta);
+    let fastStarted = false;
+    if (meta.deploy_fp && meta.deploy_fp === deployFp && meta.source_type !== "source") {
+      try {
+        const entry = (await thvListJson()).find((x) => x.name === workload);
+        if (entry && !/running/i.test(String(entry.status || ""))) {
+          const { stdout: stoppedNames } = await execFileHidden(
+            "docker",
+            ["ps", "-a", "--filter", `name=${workload}`, "--filter", "status=exited", "--format", "{{.Names}}"],
+            { timeout: 15000, maxBuffer: MAX_BUFFER },
+          );
+          const names = stoppedNames.split(/\r?\n/).map((s) => s.trim())
+            .filter((n) => n && n !== `${workload}-ingress`); // -ingress 是平台 socat，由 ensureStableIngress 重建
+          if (names.length) {
+            await execFileHidden("docker", ["start", ...names], { timeout: 60000, maxBuffer: MAX_BUFFER });
+            fastStarted = true;
+          }
+        }
+      } catch (_) { /* 快启失败退回完整链 */ }
+    }
+    if (!fastStarted) try {
       // 幂等：先清理同名 workload（避免重部署时 "already exists" 冲突），
       // 不存在或已删时 thv rm 会报错，由 try/catch 吞掉即可。
       try {
@@ -146,6 +188,32 @@ module.exports = function createDeployService(ctx) {
       patchMeta(id, { deploy_status: "failed", deploy_error: msg });
       return;
     }
+    if (fastStarted) {
+      // 原地恢复就绪轮询：docker start 不会复活 thv 的宿主代理进程，thv 报告的 url 已死，
+      // 故不走下方 thv-url 轮询，改走平台自己的固定端口 ingress 链路：
+      // 主容器就绪 → ensureStableIngress 重建 socat（若主容器 IP 变了也能纠正）→ 探活。
+      let fastEndpoint = null;
+      for (let i = 0; i < 60; i++) { // 上限 ~3 分钟，实测秒级
+        await sleep(3000);
+        try {
+          const p = await ensureStableIngress(workload, meta);
+          if (p && await probeMcpEndpoint(`http://127.0.0.1:${p}/mcp`)) {
+            fastEndpoint = `http://127.0.0.1:${p}/mcp`;
+            break;
+          }
+        } catch (_) { /* 未就绪，继续轮询 */ }
+      }
+      if (fastEndpoint) {
+        patchMeta(id, { deploy_status: "deployed", endpoint: fastEndpoint, deploy_error: "", deploy_fp: deployFp });
+        registryPublish(id).catch((e) => console.error("同步 Registry 失败:", e));
+        return;
+      }
+      patchMeta(id, {
+        deploy_status: "failed",
+        deploy_error: "快启恢复超时：容器已运行但固定端口端点不可达，请重试部署（将自动走完整链）",
+      });
+      return;
+    }
     // 轮询端点（最多 ~10 分钟）。thv runtime 启容器 + health check + 端口 ready
     // 在大镜像/冷启动时可能数分钟，原 60×3s=180s 太短会让 deploying 误判 failed。
     let endpoint = null;
@@ -168,7 +236,7 @@ module.exports = function createDeployService(ctx) {
       await sleep(3000);
     }
     if (endpoint) {
-      patchMeta(id, { deploy_status: "deployed", endpoint, deploy_error: "" });
+      patchMeta(id, { deploy_status: "deployed", endpoint, deploy_error: "", deploy_fp: deployFp });
       // 提取镜像元数据（脱敏后）供详情页「代码」标签展示；失败不影响部署结果
       extractMcpInspect(image).then((insp) => {
         if (insp) patchMeta(id, { mcp_inspect: insp });
@@ -202,15 +270,35 @@ module.exports = function createDeployService(ctx) {
 
   // 下线一个 MCP：thv rm 删除容器，清掉 endpoint
   /** @param {string} id 幂等：条目不存在/非 MCP/sidecar 已清均静默返回 */
-  async function undeployMcp(id) {
+  async function undeployMcp(id, opts = {}) {
     invalidateMcpRuntimeCaches(id); // 停止/部署双清 tools/rt 两层缓存（routes/mcp 注入）
     const sub = db.prepare("SELECT * FROM submissions WHERE id=?").get(id);
     if (!sub || sub.type !== "mcp") return;
     const meta = parseMeta(sub);
     const workload = meta.workload_name || workloadNameFor(id);
     try {
-      await execFileHidden(THV_BIN, ["rm", workload], { timeout: 30000, maxBuffer: MAX_BUFFER });
-    } catch (_) { /* 不存在或已删，忽略 */ }
+      // 下线（默认）= thv stop：只停运行态，运行配置保留在 ToolHive 状态里，
+      //   重上线走 deployMcp 的 docker start 快启路径，秒级恢复、不重拉镜像。
+      // 硬删除（opts.hard，删除提交/彻底清理）= thv rm：整组移除容器与运行配置。
+      await execFileHidden(THV_BIN, [opts.hard ? "rm" : "stop", workload], { timeout: 30000, maxBuffer: MAX_BUFFER });
+    } catch (_) { /* 不存在或已停，忽略 */ }
+    if (!opts.hard) {
+      // 兜底：快启恢复的 workload 在 thv 状态机里呈 starting，thv stop 可能拒绝执行——
+      // 直接 docker stop 所有仍在运行的 thv 容器（平台 socat ingress 由下一行单独停）。
+      try {
+        const { stdout: runNames } = await execFileHidden(
+          "docker", ["ps", "--filter", `name=${workload}`, "--format", "{{.Names}}"],
+          { timeout: 15000, maxBuffer: MAX_BUFFER },
+        );
+        const names = runNames.split(/\r?\n/).map((s) => s.trim())
+          .filter((n) => n && n !== `${workload}-ingress`);
+        if (names.length) {
+          await execFileHidden("docker", ["stop", ...names], { timeout: 60000, maxBuffer: MAX_BUFFER });
+        }
+      } catch (_) {}
+      // 平台自建的固定端口 socat ingress 不归 thv 管，同步停掉（重上线时 ensureStableIngress 会重建）
+      try { await execFileHidden("docker", ["stop", `${workload}-ingress`], { timeout: 15000, maxBuffer: MAX_BUFFER }); } catch (_) {}
+    }
     patchMeta(id, { deploy_status: "undeployed", endpoint: "", deploy_error: "" });
     // 注：下线只停容器 + 清运行态，Registry 目录条目保留（按设计：仅「删除」才从 Registry 摘除）。
   }
