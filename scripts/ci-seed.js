@@ -22,7 +22,8 @@ async function main() {
   if (existing) { console.log("[ci-seed] 已存在，跳过:", existing.id || existing.group_key); return; }
 
   // 1) 构造最小合法 zip（SKILL.md，内容避开注入规则：不含 URL/编码块/危险 API）
-  const { buildZip } = require("../lib/pkg");
+  // lib/pkg 自拆分后为 CTX 工厂（makePkg(ctx)），buildZip 为纯函数不依赖 ctx，传空对象即可
+  const { buildZip } = require("../lib/pkg")({});
   const zip = buildZip([{
     name: "SKILL.md",
     data: Buffer.from("---\nname: ci-seed\ndescription: CI seed skill for smoke download\n---\n# ci-seed\nMinimal seed skill.", "utf8"),
