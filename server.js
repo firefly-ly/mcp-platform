@@ -195,9 +195,10 @@ const MCP_IMAGE_ALIASES = {
 // 与已发布管理出现不一致。
 const LIVE_MCPS = [];
 
-// ingress 端口发现与端点解析（rewriteForWsl2/getIngressPort/discoverIngressForSubmission/
+// ingress 端口发现与端点解析（rewriteForWsl2/discoverIngressForSubmission/
 // discoverThvEndpoint/resolveEndpoint）已拆至 lib/ingress.js，见 env-secrets 装配后的 require。
-// ensureStableIngress / rebuildIngress / healMcpIngress 留守本文件（耦合 db/audit 自愈层）。
+// 固定端口 ingress 自愈层（getIngressPort/stablePortFor/ensureStableIngress/rebuildIngress/
+// healMcpIngress/subIdByWorkload）已拆至 lib/ingress-heal.js（2026-09-19 拆分第六步）。
 
 // MCP 协议客户端（probeMcpEndpoint/mcpCall/mcpCallAuthed/parseSSE/mcpPost/r401403）
 // 已拆至 lib/mcp-client.js，见下方 env-secrets 装配后的 require。
@@ -436,16 +437,31 @@ const {
   storeSubmissionEnv, deleteSubmissionSecrets, envInjectArgs, authHeaderCandidates,
 } = require("./lib/env-secrets")(CTX);
 // MCP 协议客户端（2026-09-18 拆分第五步）：纯 fetch 无状态，仅需 authHeaderCandidates。
-// probeMcpEndpoint/mcpCallAuthed 供 ensureStableIngress、代理链路与 routes/mcp 使用。
+// probeMcpEndpoint/mcpCallAuthed 供 ingress 自愈层、代理链路与 routes/mcp 使用。
 const { probeMcpEndpoint, mcpCallAuthed } = require("./lib/mcp-client")({ authHeaderCandidates });
+// ingress 自愈层（2026-09-19 拆分第六步）：固定端口 ingress 的幂等确保/重建/健康自愈回写。
+// getIngressPort 归位于此（docker port 查询原生属自愈域），lib/ingress 经 ctx 注入使用——
+// 依赖方向单向：ingress → ingress-heal，无装配循环。db/parseMeta/patchMeta 皆在此之前就绪。
+const { getIngressPort, ensureStableIngress, healMcpIngress, subIdByWorkload } =
+  require("./lib/ingress-heal")({
+    execFileHidden, MAX_BUFFER, probeMcpEndpoint,
+    db, parseMeta, patchMeta, workloadNameFor,
+  });
 // ingress 端口发现/端点解析（2026-09-18 拆分第五步）：依赖全部经 ctx 注入——
-// parseMeta/workloadNameFor/thvListJson/ensureStableIngress 为函数声明（提升可用），
+// parseMeta/workloadNameFor/thvListJson 为函数声明（提升可用），
 // MAX_BUFFER/MCP_IMAGE_ALIASES/LIVE_ENDPOINTS 为 const（本行位于其声明之后，无 TDZ）。
-const { rewriteForWsl2, getIngressPort, discoverIngressForSubmission, discoverThvEndpoint, resolveEndpoint } =
+const { rewriteForWsl2, discoverIngressForSubmission, discoverThvEndpoint, resolveEndpoint } =
   require("./lib/ingress")({
     execFileHidden, MAX_BUFFER, parseMeta, workloadNameFor,
-    ensureStableIngress, thvListJson, MCP_IMAGE_ALIASES, LIVE_ENDPOINTS,
+    getIngressPort, ensureStableIngress, thvListJson, MCP_IMAGE_ALIASES, LIVE_ENDPOINTS,
   });
+// MCP 代理处理器（2026-09-19 拆分第六步）：目标解析 + token 门禁 + 管道转发 + 失败自愈触发。
+// 路由注册留在本文件（4000 回环口在 express.json 之前、4100 对外口 forceToken=true），
+// audit/deniedThrottled/authHeaderCandidates 皆在此之前装配就绪。
+const { resolveMcpProxyTarget, mcpProxyHandler } = require("./lib/mcp-proxy")({
+  http, db, parseMeta, workloadNameFor, authHeaderCandidates, deniedThrottled, audit,
+  getIngressPort, ensureStableIngress, discoverThvEndpoint, subIdByWorkload, healMcpIngress,
+});
 const { buildSourceImage, SOURCE_MAX_MB } = require("./lib/source-build")(CTX);
 const {
   trivyUsable, runTrivyScan, runPromptScan, runSubmissionScans, PROMPT_INJECTION_RULES,
@@ -875,305 +891,8 @@ app.use(cors(process.env.TRUST_GATEWAY === "1" ? { origin: false } : {}));
 //   · `--proxy-port`   —— thv 代理短暂监听后退出（14501 监听后消失）
 // 而 Docker ingress 映射始终可用（/health 稳定 200）。
 // 故改由平台后端统一转发：对外只暴露后端自身端口（4000），对内动态发现 ingress 端口。
-// ---- 兜底：thv 未自动创建 <workload>-ingress 时的自愈 ----
-// 背景：thv 对「纯容器 image run」(尤其无 OCI provenance label 的镜像) 有时不会自动
-// 建 squid ingress 容器 → getIngressPort 拿不到端口 → /mcp-proxy 全 502。
-// 方案：探测到无 ingress 时，自动起一个 socat 反向代理容器（命名 <workload>-ingress，
-// 复刻 thv ingress 结构：连 toolhive-external 提供 host publish + connect 到 workload
-// 的 internal 网络以路由到主容器），把主容器 MCP 端口暴露到 host 固定端口。
-async function findMcpMainContainer(workload) {
-  try {
-    const { stdout } = await execFileHidden(
-      "docker", ["inspect", "--format", "{{json .}}", workload],
-      { timeout: 12000, maxBuffer: MAX_BUFFER },
-    );
-    const info = JSON.parse(stdout);
-    const nets = (info.NetworkSettings && info.NetworkSettings.Networks) || {};
-    // 主容器所在网络通常是 toolhive-<workload>-internal
-    const netName =
-      Object.keys(nets).find((n) => n === `toolhive-${workload}-internal`) ||
-      Object.keys(nets).find((n) => n.includes("-internal")) ||
-      Object.keys(nets)[0];
-    const ip = netName ? nets[netName].IPAddress : null;
-    // MCP 监听端口。注意容器 env 里的 MCP_PORT / FASTMCP_PORT 是 thv 按 --target-port
-    // 回写的"假设值"（写死 3000 时代它会跟着错），不是事实——-authoritative 是镜像自己的
-    // EXPOSE（作者声明）。容器 Config.ExposedPorts 也会被 thv 追加污染，所以查镜像配置。
-    let port = null;
-    try {
-      const imgRef = (info.Config && info.Config.Image) || workload;
-      const imgOut = await execFileHidden("docker", ["inspect", "--format", "{{json .Config.ExposedPorts}}", imgRef], { timeout: 12000, maxBuffer: MAX_BUFFER });
-      const imgExposed = JSON.parse(String(imgOut.stdout || "{}").trim() || "{}");
-      const keys = Object.keys(imgExposed);
-      if (keys.length) {
-        // 多端口时优先平台约定的 3000，否则取第一个
-        const hit = keys.find((k) => String(k).split("/")[0] === "3000") || keys[0];
-        port = Number(String(hit).split("/")[0]) || null;
-      }
-    } catch (_) { /* 镜像配置读不到再走 env/端口映射回退 */ }
-    if (!port) {
-      const env = (info.Config && info.Config.Env) || [];
-      const pv = env.find((e) => e.startsWith("MCP_PORT=")) ||
-                  env.find((e) => e.startsWith("FASTMCP_PORT="));
-      if (pv) port = Number(pv.split("=")[1]) || null;
-    }
-    if (!port) {
-      const ex = (info.NetworkSettings && info.NetworkSettings.Ports) || {};
-      port = Number(Object.keys(ex)[0] && Object.keys(ex)[0].split("/")[0]) || null;
-    }
-    return { ip, port, netName };
-  } catch (_) {
-    return null;
-  }
-}
-
-// 基于 workload 名派生的稳定 host 端口（36000-36999）：同一名永远算出同一端口，
-// 这是「固定端口」层的根基——ingress 重建后端口不变，meta.endpoint 不再漂移。
-function stablePortFor(workload, offset = 0) {
-  return 36000 + ((hashCode(workload) + offset) % 1000);
-}
-
-// 固定端口 ingress（幂等确保）：
-//   1) 现有 ingress 端口 == 固定值且探测通过 → 直接复用（快路径）
-//   2) 现有 ingress 可用但非固定端口（如 thv 的动态 squid）→ rebuild=false 时先用它；
-//      rebuild=true（部署/自愈）时重建为固定端口 socat ingress
-//   3) 坏 ingress（端口在但 502）或无 ingress → 重建；固定端口被占时线性后移重试
-// 返回实际可用的 host 端口；彻底失败时回退现有动态端口（若有）。
-// 同一 workload 的 ingress 重建任务表（单飞）：并发重建会互相 rm 掉对方刚建好的
-// 容器，造成 ingress 反复抖动、接口拖死——同 workload 的重建必须共享一个任务
-const ingressRebuildJobs = new Map();
-
-async function ensureStableIngress(workload, meta = {}, { rebuild = true } = {}) {
-  const fixed = Number(meta && meta.ingress_port) || stablePortFor(workload);
-  const cur = await getIngressPort(workload);
-  if (cur === String(fixed)) {
-    if (await probeMcpEndpoint(`http://127.0.0.1:${fixed}/mcp`)) return fixed;
-  } else if (cur && (await probeMcpEndpoint(`http://127.0.0.1:${cur}/mcp`))) {
-    if (!rebuild) return Number(cur);
-  }
-  if (!rebuild) return null;
-  let job = ingressRebuildJobs.get(workload);
-  if (!job) {
-    job = rebuildIngress(workload, cur).finally(() =>
-      ingressRebuildJobs.delete(workload),
-    );
-    ingressRebuildJobs.set(workload, job);
-  }
-  return job;
-}
-
-async function rebuildIngress(workload, cur) {
-  const ingressName = `${workload}-ingress`;
-  const main = await findMcpMainContainer(workload);
-  if (!main || !main.ip || !main.port) return cur ? Number(cur) : null;
-  // 需要 external 网络作 host publish 通道
-  let extNet = "toolhive-external";
-  try {
-    const { stdout } = await execFileHidden("docker", ["network", "ls", "--format", "{{.Name}}"], { timeout: 8000, maxBuffer: MAX_BUFFER });
-    const all = stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-    if (!all.includes(extNet)) {
-      const fallback = all.find((n) => n.includes("external"));
-      if (fallback) extNet = fallback;
-      else return cur ? Number(cur) : null; // 无 external 网络，无法 host publish
-    }
-  } catch (_) { return cur ? Number(cur) : null; }
-  for (let off = 0; off < 5; off++) {
-    const hostPort = stablePortFor(workload, off * 37);
-    // 清理同名旧容器（无论它是 thv 的动态 squid 还是坏死的 socat）——统一收敛到固定端口
-    try { await execFileHidden("docker", ["rm", "-f", ingressName], { timeout: 15000, maxBuffer: MAX_BUFFER }); } catch (_) {} // 容器可能本就不存在，rm 失败不影响后续重建
-    try {
-      await execFileHidden(
-        "docker", ["run", "-d", "--restart", "unless-stopped", "--name", ingressName, "--network", extNet,
-          "-p", `127.0.0.1:${hostPort}:${hostPort}`, "alpine/socat",
-          `TCP-LISTEN:${hostPort},fork,reuseaddr`, `TCP:${main.ip}:${main.port}`],
-        { timeout: 60000, maxBuffer: MAX_BUFFER },
-      );
-      // 加入 internal 网络使 socat 能路由到主容器
-      await execFileHidden("docker", ["network", "connect", main.netName, ingressName], { timeout: 15000, maxBuffer: MAX_BUFFER }).catch(() => {});
-    } catch (_) { continue; }
-    // 等 socat 就绪后探测确认（docker port 对已退出容器也显示映射，probe 才是真验证）
-    await sleep(2000);
-    const p = await getIngressPort(workload);
-    if (String(p) === String(hostPort) && (await probeMcpEndpoint(`http://127.0.0.1:${hostPort}/mcp`))) {
-      return hostPort;
-    }
-  }
-  return cur ? Number(cur) : null;
-}
-
-function hashCode(str) {
-  let h = 0;
-  for (let i = 0; i < str.length; i++) {
-    h = (Math.imul(31, h) + str.charCodeAt(i)) | 0;
-  }
-  return Math.abs(h);
-}
-
-// 探测+自愈+回写（「健康探测自愈」层核心）：固定端口 ingress 不可用则重建（端口不变），
-// 并把真实端口/endpoint 回写 meta——保证 DB 里的 endpoint 始终等于实际在听的端口。
-async function healMcpIngress(id) {
-  const sub = db.prepare("SELECT * FROM submissions WHERE id=?").get(id);
-  if (!sub || sub.type !== "mcp") return null;
-  const meta = parseMeta(sub);
-  if (meta.deploy_status !== "deployed") return null;
-  const workload = meta.workload_name || workloadNameFor(id);
-  const p = await ensureStableIngress(workload, meta);
-  if (!p) return null;
-  const endpoint = `http://127.0.0.1:${p}/mcp`;
-  if (endpoint !== meta.endpoint || p !== Number(meta.ingress_port)) {
-    patchMeta(id, { endpoint, ingress_port: p, deploy_error: "" });
-  }
-  return endpoint;
-}
-
-// 按 workload 名反查 submission id（proxy 转发失败时触发自愈用）
-function subIdByWorkload(workload) {
-  if (!workload) return null;
-  const row = db
-    .prepare("SELECT id FROM submissions WHERE type='mcp' AND meta LIKE ?")
-    .get(`%"workload_name":"${workload}"%`);
-  return row ? row.id : null;
-}
-
-// 用户复制到的 URL 因此永久有效，不随容器重建变化。
-async function resolveMcpProxyTarget(name) {
-  let workload = null;
-  let meta = {};
-  // 1) name 是 submission id —— 换算 workload 名；name 直接是 workload 名也算
-  const sub = db
-    .prepare("SELECT * FROM submissions WHERE id=? AND type='mcp'")
-    .get(name);
-  if (sub) {
-    meta = parseMeta(sub);
-    workload = meta.workload_name || workloadNameFor(sub.id);
-  } else if (name && /^mcp-/.test(name)) {
-    workload = name;
-  }
-  if (workload) {
-    // 现有 ingress 端口（自愈任务会把它维持在固定端口上）
-    const direct = await getIngressPort(workload);
-    if (direct) return { host: "127.0.0.1", port: Number(direct), path: "/mcp", workload };
-    // 无 ingress → 幂等重建固定端口 socat ingress
-    const p = await ensureStableIngress(workload, meta);
-    if (p) return { host: "127.0.0.1", port: p, path: "/mcp", workload };
-  }
-  // 2) name 是 item_ref（LIVE_MCPS 等）—— 经 thv list 按镜像别名动态发现
-  const ep = await discoverThvEndpoint(name);
-  if (ep) {
-    try {
-      const u = new URL(ep);
-      return { host: u.hostname, port: Number(u.port) || 80, path: u.pathname };
-    } catch (_) {
-      /* 解析失败继续返回 null */
-    }
-  }
-  return null;
-}
-
 // 注意：必须注册在 express.json() 之前，否则请求体已被消费，管道转发会拿到空 body。
 app.use("/mcp-proxy/:name", (req, res) => mcpProxyHandler(req, res, {}));
-
-// 代理处理器主体（4000 回环口与 4100 对外口共用）。
-// opts.forceToken=true（对外口）：无条件校验 token——对外口上 token 是唯一凭证，
-// mode=all 也不例外（回环口维持原语义：仅 restricted 校验）。
-/**
- * MCP 代理处理器：token 门禁 → 解析目标实例 → 管道转发。
- * 安全语义（两个监听口共用此函数，差异仅由 opts.forceToken 表达）：
- *  - 回环 4000：restricted 条目要求 Bearer/X-MCP-Token/?t= 三来源之一命中 meta.mcp_token；
- *  - 对外 4100：forceToken=true，所有条目（含 mode=all）一律强制校验，token 是唯一门禁；
- *  - token 校验先于实例解析——无 token 的 restricted/对外请求在碰 Docker 之前就被 403。
- * @param {import("express").Request} req
- * @param {import("express").Response} res
- * @param {{forceToken?: boolean}} opts
- */
-async function mcpProxyHandler(req, res, opts = {}) {
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-
-  const name = req.params.name;
-  const sid = subIdByWorkload(name) || (String(name).startsWith("sub_") ? name : null);
-  let proxyMeta = null;
-  if (sid) {
-    const row = db.prepare("SELECT meta FROM submissions WHERE id=?").get(sid);
-    if (row) {
-      const meta = parseMeta(row);
-      proxyMeta = meta;
-      const v = meta.visibility;
-      const needToken = opts.forceToken || (v && v.mode === "restricted");
-      if (needToken) {
-        // token 三来源（按优先级）：Authorization: Bearer / X-MCP-Token 头 / 旧 ?t=（兼容已复制配置）
-        const auth = String(req.headers["authorization"] || "");
-        const headerToken = auth.startsWith("Bearer ")
-          ? auth.slice(7).trim()
-          : String(req.headers["x-mcp-token"] || "").trim();
-        let t = headerToken || null;
-        if (!t) {
-          try { t = new URL(req.url, "http://x").searchParams.get("t"); } catch (_) {} // URL 解析失败保持 t=null，由后续校验统一 403
-        }
-        if (!meta.mcp_token || t !== meta.mcp_token) {
-          if (deniedThrottled("proxy:" + sid + ":" + (req.socket.remoteAddress || ""))) {
-            audit(req, "proxy_denied", "mcp", sid, { workload: meta.workload_name || "", reason: opts.forceToken ? "external without valid token" : "restricted without valid token" }, "denied");
-          }
-          return res.status(403).json({ error: "forbidden: 该 MCP 仅限授权成员调用（缺少或错误的访问令牌）" });
-        }
-      }
-    } else if (opts.forceToken) {
-      // 对外口：查无条目（或非 submission 条目）无法验证凭证 → 一律拒绝
-      return res.status(403).json({ error: "forbidden" });
-    }
-  } else if (opts.forceToken) {
-    return res.status(403).json({ error: "forbidden" });
-  }
-
-  resolveMcpProxyTarget(req.params.name)
-    .then((target) => {
-      if (!target) {
-        return res.status(502).json({
-          error: "MCP 未运行或找不到 ingress 端口",
-          name: req.params.name,
-        });
-      }
-      const headers = { ...req.headers };
-      delete headers.host;
-      delete headers.connection;
-      // 平台凭证代理：条目 env 里配了 API Key/Token 时，把调用方的平台凭证
-      // （mcp_token）替换为应用自身的鉴权头再转发——调用方无需（也不应）知道应用凭证。
-      const appAuth = authHeaderCandidates(proxyMeta || {})[0];
-      if (appAuth) {
-        delete headers.authorization;
-        Object.assign(headers, appAuth);
-      }
-
-      const upstream = http.request(
-        {
-          host: target.host,
-          port: target.port,
-          path: req.url || target.path,
-          method: req.method,
-          headers,
-        },
-        (upRes) => {
-          res.writeHead(upRes.statusCode || 502, upRes.headers);
-          upRes.pipe(res);
-        },
-      );
-      upstream.on("error", (e) => {
-        if (!res.headersSent) {
-          res.status(502).json({ error: "转发到 MCP 失败", detail: e.message });
-        } else {
-          res.end();
-        }
-        // 转发失败（端口漂移/ingress 坏死）→ 后台自愈：重建固定端口 ingress 并回写 meta。
-        // 本次请求不重试（SSE/POST 非幂等），下一次请求即恢复。
-        const sid = target && target.workload ? subIdByWorkload(target.workload) : null;
-        if (sid) healMcpIngress(sid).catch(() => {});
-      });
-      req.pipe(upstream);
-    })
-    .catch((e) => {
-      if (!res.headersSent) {
-        res.status(500).json({ error: "代理异常", detail: e.message });
-      }
-    });
-}
 
 app.use(express.json());
 
