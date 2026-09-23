@@ -803,6 +803,31 @@ async function registryPublish(id) {
   }
 }
 
+// 运维：registry catalog 恢复重发（跨机迁移 / registry 重建后使用，仅管理员）。
+// 遍历 registry_synced 为 published/error 的条目，逐个重跑 registryPublish；
+// 成功/失败逐条回写 meta.registry_synced，响应里给出逐条结果。
+app.post("/admin/registry-resync", async (req, res) => {
+  const actor = actorFromReq(req);
+  if (!actor.admin) return res.status(403).json({ error: "仅管理员可执行 catalog 恢复" });
+  const rows = db.prepare("SELECT id, meta FROM submissions WHERE meta LIKE '%registry_%'").all();
+  const targets = rows.filter((r) => {
+    const m = parseMeta(r);
+    return m.registry_synced === "published" || m.registry_synced === "error";
+  });
+  const results = [];
+  for (const r of targets) {
+    try {
+      await registryPublish(r.id);
+      const m2 = parseMeta(db.prepare("SELECT meta FROM submissions WHERE id=?").get(r.id));
+      results.push({ id: r.id, name: m2.name || r.id, result: m2.registry_synced, entry: m2.registry_name });
+    } catch (e) {
+      results.push({ id: r.id, result: "exception", error: String((e && e.message) || e).slice(0, 200) });
+    }
+  }
+  audit(req, "admin_registry_resync", "registry", "", { count: results.length });
+  res.json({ total: targets.length, results });
+});
+
 // 从 Registry Server 删除条目（下线 / 删除时调用）。无 registry_name 视为从未发布，跳过。
 async function registryDelete(id) {
   const sub = db.prepare("SELECT * FROM submissions WHERE id=?").get(id);
