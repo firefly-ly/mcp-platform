@@ -79,7 +79,8 @@ const post = (url, headers, payload = INIT) =>
   console.log("== B. 4100 对外口强制 Token（真实条目，只读调用） ==");
   const betterSqlite3 = require("better-sqlite3");
   // 可写连接：D 段需要插入/删除临时 restricted 条目；真实条目只读不碰
-  const db = new betterSqlite3("platform.db");
+  const { DB_FILE } = require("./db-path");
+  const db = new betterSqlite3(DB_FILE);
   const realId = "sub_1788829366889";
   const realMeta = JSON.parse(
     db.prepare("SELECT meta FROM submissions WHERE id=?").get(realId).meta,

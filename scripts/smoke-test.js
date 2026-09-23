@@ -90,7 +90,7 @@ const INIT = { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVe
     // 当前有效 token 从 DB meta 读取（脚本与本机同源，允许直读）
     let tok = null;
     try {
-      const db = require("better-sqlite3")(require("path").join(__dirname, "..", "platform.db"), { readonly: true });
+      const db = require("better-sqlite3")(require("./db-path").DB_FILE, { readonly: true });
       const m = JSON.parse(db.prepare("SELECT meta FROM submissions WHERE id=?").get(mcpId).meta);
       tok = m.mcp_token || null;
     } catch (_) {}
