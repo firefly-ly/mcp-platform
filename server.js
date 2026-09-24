@@ -539,13 +539,15 @@ function canAccessSubmission(meta, actor) {
 // 部署/下线服务句柄：由 routes/mcp 装配后创建（见文件末尾装配区），CTX 经惰性箭头引用
 let __deployService = null;
 
-// ---- P4: 同步到 Registry Server（thv-registry-api :8080）----
+// ---- P4: 同步到 Registry Server（thv-registry-api，宿主端口 :3000）----
 // 平台「审批通过 / 部署成功 / 下线 / 删除」动作，同步在 ToolHive Registry 中
 // 创建或删除对应条目，使 ToolHive 客户端与 Cloud UI 能从统一目录消费已发布的
 // MCP / Skill。
 // 前置：Registry 需存在一个 managed 源（已通过 PUT /v1/sources/platform-managed
 // 创建，持久化于 postgres，无需重启容器）。匿名模式无需 token。
-const REGISTRY_URL = (process.env.REGISTRY_URL || "http://127.0.0.1:8080").replace(/\/+$/, "");
+// 注：容器内部仍监听 :8080，宿主经 docker-compose 映射 3000:8080；
+// 2026-09-24 端口对调——宿主 8080 让位给 Cloud UI 前端（配合公司域名反代）。
+const REGISTRY_URL = (process.env.REGISTRY_URL || "http://127.0.0.1:3000").replace(/\/+$/, "");
 const REGISTRY_NAMESPACE = process.env.REGISTRY_NAMESPACE || "platform";
 
 // 解析 Registry 可达地址（WSL2 下可经 WSL2_REWRITE=1 改写为 Windows 主机 IP）

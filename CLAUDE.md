@@ -11,7 +11,7 @@
 - **运行时**: Node.js（CommonJS），单进程 Express
 - **数据库**: better-sqlite3（`platform.db`，WAL 模式），无 ORM，手写 SQL
 - **外部依赖**: ToolHive CLI（`thv`，经 `THV_BIN` 指定）、Docker（容器部署形态）、可选 MinIO（对象存储）
-- **端口**: 默认 4000（`PORT` 可覆盖）；Registry 5000、前端 3000 同机运行
+- **端口**: 默认 4000（`PORT` 可覆盖）；同机运行：Registry 宿主 3000（容器内 8080，docker-compose 3000:8080）、前端 8080（2026-09-24 端口对调，配合公司域名反代转发 8080）
 
 ## 常用命令
 
