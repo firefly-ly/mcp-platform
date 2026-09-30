@@ -194,7 +194,12 @@ module.exports = function registerSubmissionsRoutes(app, ctx) {
       // 提交者身份优先取真实邮箱（内部令牌通道 who=="internal" 时 fromReq 仍有 x-actor-email）
       const actor = actorFromReq(req);
       const user_id = String(actor.email || who || "anonymous");
-      const name = String(req.query.display_name || filename.replace(/\.(zip|tar\.gz|tgz)$/i, "")).slice(0, 80);
+      // 名称自 2026-09-30 起必填：缺失直接拒绝，不再回退文件名
+      // （此前回退导致打包文件名里的日期/版本号原样变成条目显示名）
+      if (!String(req.query.display_name || "").trim()) {
+        return res.status(400).json({ error: "display_name（名称）为必填项" });
+      }
+      const name = String(req.query.display_name).trim().slice(0, 80);
       // 版本与产品引用：用户表单填了 payload_ref（产品名:版本号）就以其为准；
       // version 缺省时不写死 1.0.0——交由 ensureGroupMeta 从 payload_ref 自动提取
       // （此前前端把空 version 兜底成 "1.0.0" 传入，导致引用里的 :2.0.2 永远不被识别）。
@@ -249,11 +254,14 @@ module.exports = function registerSubmissionsRoutes(app, ctx) {
     });
   });
 
-  // 提交（落暂存，status=pending）。meta 可选，存放 name/description/download_url 等扩展字段。
+  // 提交（落暂存，status=pending）。meta 存放 name/description/download_url 等扩展字段。
   app.post("/submissions", async (req, res) => {
     const { user_id, type, payload_ref, meta } = req.body || {};
     if (!user_id || !type || !payload_ref)
       return res.status(400).json({ error: "user_id, type, payload_ref 必填" });
+    // 名称自 2026-09-30 起必填（meta.name 缺失即拒绝，不再回退 payload_ref 显示）
+    if (!meta || !String(meta.name || "").trim())
+      return res.status(400).json({ error: "meta.name（名称）为必填项" });
 
     // 1) 限流：同用户窗口内提交数超限 → 429
     const since = new Date(Date.now() - RATE_WINDOW_MS).toISOString();
