@@ -13,6 +13,14 @@
 # 保留 KEEP_DAYS 天，自动清理过期文件。
 # 日志：~/mcp-platform/backups/backup.log
 #
+# 当天去重：同一自然日已成功备份过则跳过（支持 crontab 每日一次 +
+# @reboot 开机补跑组合——服务器 17:30~次日 8:30 停机，cron 定时点
+# 若撞上停机，开机补跑兜底）。强制重跑：SKIP_DEDUP=1 bash 本脚本。
+#
+# 推荐 crontab（服务器开机窗口 8:30~17:30）：
+#   30 12 * * *  <脚本绝对路径>          # 每日 12:30 常规备份
+#   @reboot sleep 300 && <脚本绝对路径>  # 开机 5 分钟后补跑（当天已备则跳过）
+#
 # 恢复方法：
 #   PG：    docker exec -i <pg容器> psql -U <superuser> -d postgres < xxx.sql.gz 的解压结果
 #   SQLite：sudo systemctl stop mcp-backend → 用备份 .db 替换
@@ -25,9 +33,16 @@ OUT="$BASE/backups"
 KEEP_DAYS=14
 LOG="$OUT/backup.log"
 TS=$(date +%F_%H%M)
+TODAY=$(date +%F)
 mkdir -p "$OUT"
 
 log() { echo "[$(date '+%F %T')] $*" >> "$LOG"; }
+
+# ---- 0. 当天去重（已成功备份过则跳过；SKIP_DEDUP=1 强制执行）----
+if [ "${SKIP_DEDUP:-0}" != "1" ] && ls "$OUT"/auth-pg_"$TODAY"_*.sql.gz >/dev/null 2>&1; then
+  log "SKIP: $TODAY 已有备份（去重生效），如需强制重跑：SKIP_DEDUP=1 $0"
+  exit 0
+fi
 
 # ---- 1. auth PG（官方镜像对容器内本地 socket 信任，postgres 超管可直接导出）----
 docker exec toolhive-auth-db pg_dumpall -U postgres 2>>"$LOG" \
@@ -59,7 +74,7 @@ fi
 # ---- 4. 配置文件（含密钥，注意备份目录权限）----
 CFG_DIR="$OUT/configs_$TS"
 mkdir -p "$CFG_DIR"
-cp -f "$BASE/toolhive-registry-server-src/toolhive-cloud-ui/.env.local" "$CFG_DIR/" 2>>"$LOG" || true
+cp -f "$(systemctl show mcp-frontend -p WorkingDirectory --value 2>/dev/null || echo "$BASE/toolhive-registry-server-src/toolhive-cloud-ui")/.env.local" "$CFG_DIR/" 2>>"$LOG" || true
 cp -f "$BASE/platform-backend/.env" "$CFG_DIR/" 2>>"$LOG" || true
 find "$BASE" -maxdepth 3 -type d -name conf -path "*casdoor*" \
   -exec cp -r {} "$CFG_DIR/" \; 2>>"$LOG" || true
