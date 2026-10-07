@@ -544,11 +544,22 @@ let __deployService = null;
 // 创建或删除对应条目，使 ToolHive 客户端与 Cloud UI 能从统一目录消费已发布的
 // MCP / Skill。
 // 前置：Registry 需存在一个 managed 源（已通过 PUT /v1/sources/platform-managed
-// 创建，持久化于 postgres，无需重启容器）。匿名模式无需 token。
+// 创建，持久化于 postgres，无需重启容器）。Registry 为 anonymous 模式时无需
+// token；切 oauth 后通过 REGISTRY_TOKEN 环境变量携带机器凭证（见下方 registryHeaders）。
 // 注：容器内部仍监听 :8080，宿主经 docker-compose 映射 3000:8080；
 // 2026-09-24 端口对调——宿主 8080 让位给 Cloud UI 前端（配合公司域名反代）。
 const REGISTRY_URL = (process.env.REGISTRY_URL || "http://127.0.0.1:3000").replace(/\/+$/, "");
 const REGISTRY_NAMESPACE = process.env.REGISTRY_NAMESPACE || "platform";
+// Registry 切 oauth 鉴权后的机器凭证：设置 REGISTRY_TOKEN 时，
+// 发布/删除请求自动附带 Authorization: Bearer（token 需为 registry
+// validator 认可的凭证，如 Casdoor 签发的 JWT）。未设置则保持匿名调用。
+const REGISTRY_TOKEN = (process.env.REGISTRY_TOKEN || "").trim();
+
+function registryHeaders(extra) {
+  const h = { ...(extra || {}) };
+  if (REGISTRY_TOKEN) h["Authorization"] = "Bearer " + REGISTRY_TOKEN;
+  return h;
+}
 
 // 解析 Registry 可达地址（WSL2 下可经 WSL2_REWRITE=1 改写为 Windows 主机 IP）
 function registryUrl() {
@@ -789,7 +800,7 @@ async function registryPublish(id) {
   try {
     const res = await fetch(registryUrl() + "/v1/entries", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: registryHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(body),
     });
     if (res.status === 201 || res.status === 200 || res.status === 409) {
@@ -816,7 +827,7 @@ async function registryDelete(id) {
   const entryType = sub.type === "mcp" ? "server" : "skill";
   const url = `${registryUrl()}/v1/entries/${entryType}/${encodeURIComponent(name)}/versions/${encodeURIComponent(version)}`;
   try {
-    const res = await fetch(url, { method: "DELETE" });
+    const res = await fetch(url, { method: "DELETE", headers: registryHeaders() });
     if (res.status === 204 || res.status === 404) {
       patchMeta(id, { registry_synced: "deleted", registry_sync_error: "" });
     } else {
