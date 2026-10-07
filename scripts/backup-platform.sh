@@ -44,15 +44,24 @@ if [ "${SKIP_DEDUP:-0}" != "1" ] && ls "$OUT"/auth-pg_"$TODAY"_*.sql.gz >/dev/nu
   exit 0
 fi
 
-# ---- 1. auth PG（官方镜像对容器内本地 socket 信任，postgres 超管可直接导出）----
-docker exec toolhive-auth-db pg_dumpall -U postgres 2>>"$LOG" \
+# ---- 1. auth PG（官方镜像对容器内本地 socket 信任，超管 = POSTGRES_USER，默认 auth）----
+AUTH_PG_USER="${AUTH_PG_USER:-auth}"
+docker exec toolhive-auth-db pg_dumpall -U "$AUTH_PG_USER" 2>>"$LOG" \
   | gzip > "$OUT/auth-pg_$TS.sql.gz" \
-  && log "auth-pg OK" || log "auth-pg FAIL"
+  && log "auth-pg OK ($(du -h "$OUT/auth-pg_$TS.sql.gz" | cut -f1))" || log "auth-pg FAIL"
 
 # ---- 2. registry PG（compose 里 POSTGRES_USER=registry 即该实例超管）----
-docker exec toolhive-registry-postgres pg_dumpall -U registry 2>>"$LOG" \
+REGISTRY_PG_USER="${REGISTRY_PG_USER:-registry}"
+docker exec toolhive-registry-postgres pg_dumpall -U "$REGISTRY_PG_USER" 2>>"$LOG" \
   | gzip > "$OUT/registry-pg_$TS.sql.gz" \
-  && log "registry-pg OK" || log "registry-pg FAIL"
+  && log "registry-pg OK ($(du -h "$OUT/registry-pg_$TS.sql.gz" | cut -f1))" || log "registry-pg FAIL"
+
+# ---- 1b. 产物完整性哨兵：SQL 备份 < 1KB 视为可疑（空库导出也有 gzip 头尾）----
+for f in "$OUT/auth-pg_$TS.sql.gz" "$OUT/registry-pg_$TS.sql.gz"; do
+  if [ -f "$f" ] && [ "$(stat -c%s "$f")" -lt 1024 ]; then
+    log "WARN: $(basename "$f") 小于 1KB，疑似导出失败（超管用户名不对？），请人工核查"
+  fi
+done
 
 # ---- 3. platform-backend SQLite（WAL 模式：优先 sqlite3 在线备份，免停服且一致）----
 DB="$HOME/.local/share/platform-backend/platform.db"
@@ -72,12 +81,16 @@ else
 fi
 
 # ---- 4. 配置文件（含密钥，注意备份目录权限）----
+# 路径动态取：前端 .env.local 跟着 mcp-frontend 的 WorkingDirectory，
+# 后端 .env 跟着 mcp-backend 的 WorkingDirectory（即本脚本部署目录的权威值）。
 CFG_DIR="$OUT/configs_$TS"
 mkdir -p "$CFG_DIR"
-cp -f "$(systemctl show mcp-frontend -p WorkingDirectory --value 2>/dev/null || echo "$BASE/toolhive-registry-server-src/toolhive-cloud-ui")/.env.local" "$CFG_DIR/" 2>>"$LOG" || true
-cp -f "$BASE/platform-backend/.env" "$CFG_DIR/" 2>>"$LOG" || true
-find "$BASE" -maxdepth 3 -type d -name conf -path "*casdoor*" \
-  -exec cp -r {} "$CFG_DIR/" \; 2>>"$LOG" || true
+FRONT_ENV="$(systemctl show mcp-frontend -p WorkingDirectory --value 2>/dev/null)/.env.local"
+BACK_ENV="$(systemctl show mcp-backend -p WorkingDirectory --value 2>/dev/null)/.env"
+cp -f "$FRONT_ENV" "$CFG_DIR/" 2>>"$LOG" || log "WARN: 前端 .env.local 未备到 ($FRONT_ENV)"
+cp -f "$BACK_ENV" "$CFG_DIR/" 2>>"$LOG" || log "WARN: 后端 .env 未备到 ($BACK_ENV)"
+# Casdoor 目录属主非 dp-user 且服务在退役中，不再纳入备份；若要恢复：
+# sudo find ... -exec cp（需给 cron 配免密 sudo，不值得）
 tar czf "$OUT/configs_$TS.tar.gz" -C "$OUT" "configs_$TS" 2>>"$LOG" \
   && rm -rf "$CFG_DIR" && log "configs OK" || log "configs FAIL"
 chmod -R go-rwx "$OUT" 2>>"$LOG"   # 备份含敏感数据，仅属主可读
