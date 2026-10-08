@@ -11,7 +11,7 @@
     "check:split": "node scripts/check-split-integrity.js",
     "test:smoke": "node scripts/smoke-test.js",
     "test:security": "node scripts/security-test.js",
-    "prepare": "husky"
+    "prepare": "husky || exit 0"
   },
   "dependencies": {
     "better-sqlite3": "^11.3.0",
