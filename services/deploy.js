@@ -19,6 +19,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const { parseIsolateOffSet, isolateNetworkOff } = require("../lib/network-isolation");
 
 /** @param {DeployCtx} ctx */
 module.exports = function createDeployService(ctx) {
@@ -48,16 +49,18 @@ module.exports = function createDeployService(ctx) {
     return null;
   }
 
-  // 部署配置指纹：镜像 + env 注入参数 + 传输形态的稳定哈希。
+  // 部署配置指纹：镜像 + env 注入参数 + 传输形态 + 网络隔离豁免的稳定哈希。
   // 指纹一致 ⇒ thv start 恢复的旧运行配置与本次期望完全一致，可安全走秒级快启；
   // 注意它锁定的是「配置字符串」——镜像 tag 被原地覆盖同名校验不到（内部镜像约定不可变 tag），
-  // 这类场景请删除提交重新走完整链。
-  function deployFingerprint(image, meta) {
+  // 这类场景请删除提交重新走完整链。隔离豁免纳入指纹：改 THV_ISOLATE_NETWORK_OFF 后
+  // 指纹必然变化，快启自动失效、强制走完整 rm+run 链使新网络配置生效。
+  function deployFingerprint(image, meta, isolateOff) {
     const args = envInjectArgs(meta);
     const norm = JSON.stringify({
       image, args,
       transport: meta.transport || "",
       source_type: meta.source_type || "",
+      isolate: Boolean(isolateOff),
     });
     return crypto.createHash("sha256").update(norm).digest("hex").slice(0, 16);
   }
@@ -89,6 +92,11 @@ module.exports = function createDeployService(ctx) {
     const sub = db.prepare("SELECT * FROM submissions WHERE id=?").get(id);
     if (!sub || sub.type !== "mcp") return;
     const meta = parseMeta(sub);
+    // 网络隔离豁免（按条目）：.env THV_ISOLATE_NETWORK_OFF 命中本条目时退出 thv 隔离网络。
+    // 背景：隔离网络出网仅 HTTP egress，数据库裸 TCP（新零售 DWS）不通 → tools 列表空。
+    const isolateOff = isolateNetworkOff(
+      parseIsolateOffSet(process.env.THV_ISOLATE_NETWORK_OFF), id, meta
+    );
     // 源码包提交：先平台侧构建本地镜像（building 状态），构建产物走与镜像包一致的部署链
     let sourceBuiltImage = null;
     if (meta.source_type === "source") {
@@ -154,7 +162,7 @@ module.exports = function createDeployService(ctx) {
     //（docker.io 不稳时卡死数分钟，这正是「重新部署很久」的根因）。
     // 门禁：① meta.deploy_fp 与当前指纹一致（镜像/env 注入/传输均未变）；
     //      ② source 构建不快启——重建后镜像名字符串不变、指纹感知不到代码变更，必须走完整链。
-    const deployFp = deployFingerprint(image, meta);
+    const deployFp = deployFingerprint(image, meta, isolateOff);
     let fastStarted = false;
     if (meta.deploy_fp && meta.deploy_fp === deployFp && meta.source_type !== "source") {
       try {
@@ -200,6 +208,9 @@ module.exports = function createDeployService(ctx) {
       } else if (meta.transport === "sse") {
         args.push("--proxy-mode", "sse");
       }
+      // 网络隔离豁免：命中清单的条目退出 thv 隔离网络（容器直连宿主网络栈，
+      // 裸 TCP 数据库可达）。未命中条目保持默认隔离不变。
+      if (isolateOff) args.push("--isolate-network=false");
       // .env 私密配置注入：secret 引用形态（值由 ToolHive 启动容器时向加密凭据库请求）
       args.push(...envInjectArgs(meta));
       await execFileHidden(THV_BIN, args, { timeout: 180000, maxBuffer: MAX_BUFFER });
