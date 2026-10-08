@@ -6,6 +6,7 @@
 // 声明位置靠后，const 无提升——延迟到文件末尾装配可规避 TDZ。
 "use strict";
 const path = require("node:path");
+const logger = require("../lib/logger");
 
 // README/文件树提取规则版本号（与 routes/mcp.js 各自独立持有一份，语义一致）
 const MCP_README_INSPECT_VERSION = 3;
@@ -191,7 +192,7 @@ module.exports = function registerSubmissionsRoutes(app, ctx) {
     patchMeta(sub.id, { visibility, visibility_configured: true });
     // Skill 上架：此前未发布到 Registry（approve 时延后），此刻才发布，使其对目录/用户可发现
     if (sub.type === "skill") {
-      registryPublish(sub.id).catch((e) => console.error("同步 Registry 失败(上架):", sub.id, e && e.message));
+      registryPublish(sub.id).catch((e) => logger.error("同步 Registry 失败(上架):", sub.id, e && e.message));
     }
     audit(req, "visibility_change", sub.type, sub.id, { from: prevVis, to: visibility });
     res.json({ id: sub.id, visibility, visibility_configured: true });
@@ -269,12 +270,12 @@ module.exports = function registerSubmissionsRoutes(app, ctx) {
         const ver = m0.version || "1.0.0";
         const fn = m0.artifact_filename || path.basename(m0.artifact_key);
         const pub = await promoteArtifact(m0.artifact_key, gk, ver, fn).catch((e) => {
-          console.error("[artifact] 提升至已发布区失败(保留原 key):", m0.artifact_key, e && e.message);
+          logger.error("[artifact] 提升至已发布区失败(保留原 key):", m0.artifact_key, e && e.message);
           return null;
         });
         if (pub) {
           patchMeta(id, { artifact_key: pub });
-          console.log("[artifact] 已提升至已发布区:", m0.artifact_key, "->", pub);
+          logger.info("[artifact] 已提升至已发布区:", m0.artifact_key, "->", pub);
         }
       }
       // 解包 Skill 包提取 README 与文件树（仅当存在制品），结果回写 meta 供详情页展示
@@ -287,7 +288,7 @@ module.exports = function registerSubmissionsRoutes(app, ctx) {
             skill_tree: insp.tree,
             skill_file_count: insp.file_count,
           });
-        }).catch((e) => console.error("[inspect] skill 解包失败:", id, e && e.message));
+        }).catch((e) => logger.error("[inspect] skill 解包失败:", id, e && e.message));
       }
     }
     // MCP：审批通过只把制品提升到已发布区 + 落 meta，不再自动部署。
@@ -301,12 +302,12 @@ module.exports = function registerSubmissionsRoutes(app, ctx) {
           const ver = meta.version || "1.0.0";
           const fn = meta.artifact_filename || path.basename(meta.artifact_key);
           const pub = await promoteArtifact(meta.artifact_key, gk, ver, fn).catch((e) => {
-            console.error("[artifact] tar 制品提升至已发布区失败(保留原 key):", meta.artifact_key, e && e.message);
+            logger.error("[artifact] tar 制品提升至已发布区失败(保留原 key):", meta.artifact_key, e && e.message);
             return null;
           });
           if (pub) {
             patchMeta(id, { artifact_key: pub });
-            console.log("[artifact] tar 已提升至已发布区:", meta.artifact_key, "->", pub);
+            logger.info("[artifact] tar 已提升至已发布区:", meta.artifact_key, "->", pub);
           }
         }
       }
@@ -323,7 +324,7 @@ module.exports = function registerSubmissionsRoutes(app, ctx) {
             mcp_file_count: insp.file_count,
             mcp_readme_inspected: MCP_README_INSPECT_VERSION,
           });
-        }).catch((e) => console.error("[inspect] mcp 源码包解包失败:", id, e && e.message));
+        }).catch((e) => logger.error("[inspect] mcp 源码包解包失败:", id, e && e.message));
       }
     }
     res.json({ id, status: "approved" });
@@ -447,9 +448,9 @@ module.exports = function registerSubmissionsRoutes(app, ctx) {
       if (m && m.artifact_key) {
         try {
           await objStore.del(m.artifact_key);
-          console.log("[artifact] 已清理制品:", m.artifact_key, "(submission:", id, "status:", status, ")");
+          logger.info("[artifact] 已清理制品:", m.artifact_key, "(submission:", id, "status:", status, ")");
         } catch (e) {
-          console.error("[artifact] 清理制品失败:", m.artifact_key, e && e.message);
+          logger.error("[artifact] 清理制品失败:", m.artifact_key, e && e.message);
         }
       }
     }
@@ -466,7 +467,7 @@ module.exports = function registerSubmissionsRoutes(app, ctx) {
           db.prepare("UPDATE submissions SET status=? WHERE id=?").run(sub.status, id);
           return res.status(409).json({ id, error: "该 MCP 正在部署/下线中，请等待当前操作完成后再删除" });
         }
-        console.error("[lifecycle] 删除时停止实例失败:", id, e && e.message);
+        logger.error("[lifecycle] 删除时停止实例失败:", id, e && e.message);
       }
     }
 

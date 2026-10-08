@@ -414,6 +414,9 @@ const CTX = {
   get PLATFORM_ROOT() { return __dirname; },
   deployMcp: (...a) => __deployService.deployMcp(...a),
   undeployMcp: (...a) => __deployService.undeployMcp(...a),
+  // 自愈专用：锁原语 + 裸版部署（reconcile 整段包锁后锁内须调不可重入的裸版，见 deploy.js 导出注释）
+  withDeployLock: (...a) => __deployService.withDeployLock(...a),
+  deployMcpInner: (...a) => __deployService.deployMcpInner(...a),
   audit: (...a) => audit(...a),
 };
 const {

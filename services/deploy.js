@@ -20,6 +20,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { parseIsolateOffSet, isolateNetworkOff } = require("../lib/network-isolation");
+const logger = require("../lib/logger");
 
 /** @param {DeployCtx} ctx */
 module.exports = function createDeployService(ctx) {
@@ -236,7 +237,7 @@ module.exports = function createDeployService(ctx) {
       }
       if (fastEndpoint) {
         patchMeta(id, { deploy_status: "deployed", endpoint: fastEndpoint, deploy_error: "", deploy_fp: deployFp });
-        registryPublish(id).catch((e) => console.error("同步 Registry 失败:", e));
+        registryPublish(id).catch((e) => logger.error("同步 Registry 失败:", (e && e.message) || e));
         return;
       }
       patchMeta(id, {
@@ -290,7 +291,7 @@ module.exports = function createDeployService(ctx) {
       // （用户侧 URL 走 /mcp-proxy 反代收敛，本就不依赖这个端口——它是详情页/诊断用的真值）。
       try { await healMcpIngress(id); } catch (_) { /* 失败则保留 thv endpoint 兜底 */ }
       // 部署成功拿到 endpoint → 同步发布到 Registry Server（使目录可消费）
-      registryPublish(id).catch((e) => console.error("同步 Registry 失败:", e));
+      registryPublish(id).catch((e) => logger.error("同步 Registry 失败:", (e && e.message) || e));
     } else {
       patchMeta(id, {
         deploy_status: "failed",
@@ -334,9 +335,14 @@ module.exports = function createDeployService(ctx) {
     // 注：下线只停容器 + 清运行态，Registry 目录条目保留（按设计：仅「删除」才从 Registry 摘除）。
   }
 
-  // 导出层统一包锁：部署/下线路由、删除提交、reconcile 自愈全部互斥
+  // 导出层统一包锁：部署/下线路由、删除提交、reconcile 自愈全部互斥。
+  // 另导出锁原语与裸版 deployMcpInner：自愈（reconcile）要把「清理孤儿容器 + 重部署」
+  // 整段包进同一把锁——复用带锁的 deployMcp 会因 Set 锁不可重入自撞 DEPLOY_BUSY；
+  // 不包锁则锁外的 docker rm -f 孤儿清理会与用户部署/下线并发互删容器。
   return {
     deployMcp: (id) => withDeployLock(id, () => deployMcpInner(id)),
     undeployMcp: (id, opts = {}) => withDeployLock(id, () => undeployMcpInner(id, opts)),
+    deployMcpInner,
+    withDeployLock,
   };
 };

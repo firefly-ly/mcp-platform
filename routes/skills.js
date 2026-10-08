@@ -4,6 +4,7 @@
 //   inspectSkillPackage、convertArtifactToZip、objStore、patchMeta、servePackageFile、MCP_TREE_MAX
 const crypto = require("node:crypto");
 const path = require("node:path");
+const logger = require("../lib/logger");
 
 module.exports = function registerSkillsRoutes(app, ctx) {
   const {
@@ -153,7 +154,7 @@ module.exports = function registerSkillsRoutes(app, ctx) {
           return res.send(payload);
         }
       } catch (e) {
-        console.error("[download] 取件/转 zip 失败", m.artifact_key, e && e.message);
+        logger.error("[download] 取件/转 zip 失败", m.artifact_key, e && e.message);
       }
     }
     const url = m.download_url;
