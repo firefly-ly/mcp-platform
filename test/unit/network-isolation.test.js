@@ -38,3 +38,21 @@ test("isolateNetworkOff：meta 缺 workload_name / 空串不误命中", () => {
   assert.equal(isolateNetworkOff(s, "sub_x", { workload_name: "" }), false);
   assert.equal(isolateNetworkOff(s, "sub_x", null), false);
 });
+
+// ---- 两段式豁免：审批授权标记（meta.network_exempt）----
+test("isolateNetworkOff：meta.network_exempt=true 优先于清单（清单为空也豁免）", () => {
+  assert.equal(isolateNetworkOff(new Set(), "sub_1", { network_exempt: true }), true);
+  assert.equal(isolateNetworkOff(new Set(), "sub_1", { network_exempt: true, workload_name: "wl" }), true);
+});
+
+test("isolateNetworkOff：network_exempt 字符串脏数据不生效（严格布尔，安全默认）", () => {
+  assert.equal(isolateNetworkOff(new Set(), "sub_1", { network_exempt: "true" }), false);
+  assert.equal(isolateNetworkOff(new Set(), "sub_1", { network_exempt: 1 }), false);
+});
+
+test("isolateNetworkOff：network_exempt=false / 未设置走原清单逻辑（回归）", () => {
+  const s = parseIsolateOffSet("sub_1");
+  assert.equal(isolateNetworkOff(s, "sub_1", { network_exempt: false }), true);
+  assert.equal(isolateNetworkOff(new Set(), "sub_2", { network_exempt: false }), false);
+  assert.equal(isolateNetworkOff(new Set(), "sub_2", {}), false);
+});

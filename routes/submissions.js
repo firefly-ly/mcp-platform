@@ -114,6 +114,24 @@ module.exports = function registerSubmissionsRoutes(app, ctx) {
       });
     }
 
+    // 数据源声明（两段式豁免第 1 段：提交者声明意图）。可选项：非法/缺失不阻断提交，
+    // 规整失败直接丢弃——审批页看不到声明自然不会给豁免，安全默认不受影响。
+    if (m.data_source !== undefined) {
+      const ds = m.data_source && typeof m.data_source === "object" ? m.data_source : {};
+      const dsType = String(ds.type || "none").trim();
+      if (["none", "http_api", "database"].includes(dsType)) {
+        m.data_source = {
+          type: dsType,
+          targets: Array.isArray(ds.targets)
+            ? ds.targets.map((t) => String(t).trim()).filter(Boolean).slice(0, 10)
+            : [],
+          note: String(ds.note || "").slice(0, 200),
+        };
+      } else {
+        delete m.data_source;
+      }
+    }
+
     // 默认可见范围：新提交默认未上线（visibility_configured=false），仅管理员在已发布管理可见。
     // 管理员审批后在「可见范围」里显式选择并保存 → visibility_configured=true → 才算上线，
     // 此后才对该条目解锁「部署」(MCP) / 对所选成员/组开放目录可见与下载(Skill)。
@@ -198,7 +216,7 @@ module.exports = function registerSubmissionsRoutes(app, ctx) {
   // 平台在此异步调 ToolHive 部署后自动回填（见 deployMcp）。
   app.post("/submissions/:id/approve", async (req, res) => {
     const { id } = req.params;
-    const { admin_id, reason, override_scan, confirm_prompt_review } = req.body || {};
+    const { admin_id, reason, override_scan, confirm_prompt_review, exempt_network } = req.body || {};
     const sub = db.prepare("SELECT * FROM submissions WHERE id=?").get(id);
     if (!sub) return res.status(404).json({ error: "submission 不存在" });
     let meta = parseMeta(sub);
@@ -219,6 +237,11 @@ module.exports = function registerSubmissionsRoutes(app, ctx) {
         prompt_scan: meta.prompt_scan,
       });
     }
+    // 两段式豁免第 2 段：审批授权。admin 显式勾选（exempt_network=true）才写标记，
+    // 提交者的 data_source 声明只是意图，永远不能自己生效。授权随审批进审计轨迹。
+    if (exempt_network === true || exempt_network === "true") {
+      meta.network_exempt = true;
+    }
     db.prepare("UPDATE submissions SET status='approved', meta=? WHERE id=?")
       .run(JSON.stringify(meta), id);
     db.prepare("INSERT INTO approvals VALUES(?,?,?,?,?,?)")
@@ -226,6 +249,8 @@ module.exports = function registerSubmissionsRoutes(app, ctx) {
     audit(req, "approve", sub.type, id, {
       reason: reason || "", admin_id: admin_id || "admin",
       override_scan: Boolean(override_scan), confirm_prompt_review: Boolean(confirm_prompt_review),
+      exempt_network: meta.network_exempt === true,
+      data_source: meta.data_source || null,
       trivy_status: meta.trivy ? meta.trivy.status : "none",
       prompt_scan_status: meta.prompt_scan ? meta.prompt_scan.status : "none",
     });

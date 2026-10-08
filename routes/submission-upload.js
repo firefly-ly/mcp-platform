@@ -183,6 +183,12 @@ module.exports = function registerSubmissionUploadRoutes(app, ctx) {
       const userRef = String(req.query.payload_ref || "").trim();
       const version = String(req.query.version || "").trim();
       const id = "sub_" + Date.now();
+      // 数据源声明（两段式豁免第 1 段，可选）：query 携带 JSON，解析/校验失败静默丢弃
+      // （此时制品已收库，声明是可选项，不该因它 400 留孤儿制品；审批看不到声明自然不给豁免）
+      let dataSource;
+      try {
+        dataSource = req.query.data_source ? JSON.parse(String(req.query.data_source)) : undefined;
+      } catch (_) { dataSource = undefined; }
       const meta = {
         name,
         ...(version ? { version } : {}),
@@ -192,6 +198,18 @@ module.exports = function registerSubmissionUploadRoutes(app, ctx) {
         visibility: { mode: "restricted", users: [], groups: [] },
         visibility_configured: false,
       };
+      if (dataSource && typeof dataSource === "object") {
+        const dsType = String(dataSource.type || "none").trim();
+        if (["none", "http_api", "database"].includes(dsType)) {
+          meta.data_source = {
+            type: dsType,
+            targets: Array.isArray(dataSource.targets)
+              ? dataSource.targets.map((t) => String(t).trim()).filter(Boolean).slice(0, 10)
+              : [],
+            note: String(dataSource.note || "").slice(0, 200),
+          };
+        }
+      }
       const metaJson = JSON.stringify(meta);
       // payload_ref：用户表单填的产品引用（产品名:版本号）优先；未填则回落 zip 文件名
       // （剥掉压缩包扩展名，避免版本提取吃到 ".zip" 尾巴）
