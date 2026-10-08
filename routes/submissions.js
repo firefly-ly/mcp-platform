@@ -8,6 +8,7 @@ const path = require("node:path");
 const fs = require("node:fs");
 const crypto = require("node:crypto");
 const express = require("express");
+const createWindowRateLimiter = require("../lib/rate-limit");
 
 // README/文件树提取规则版本号（与 routes/mcp.js 各自独立持有一份，语义一致）
 const MCP_README_INSPECT_VERSION = 3;
@@ -35,22 +36,10 @@ module.exports = function registerSubmissionsRoutes(app, ctx) {
   //   · 体积：UPLOAD_MAX_MB（默认 50MB，真实制品远小于此，100MB 是被滥用空间）
   const UPLOAD_MAX_MB = Number(process.env.UPLOAD_MAX_MB || 50);
   const UPLOAD_RATE_MAX = Number(process.env.UPLOAD_RATE_MAX || 10);
-  const uploadRateMap = new Map(); // actor -> [windowStart, count]
+  // 固定窗口限流器已抽至 lib/rate-limit.js（now 可注入，可单测），语义与原内联实现一致
+  const uploadLimiter = createWindowRateLimiter({ windowMs: RATE_WINDOW_MS, max: UPLOAD_RATE_MAX });
   function uploadAllowed(actor) {
-    const now = Date.now();
-    const entry = uploadRateMap.get(actor);
-    if (!entry || now - entry[0] > RATE_WINDOW_MS) {
-      uploadRateMap.set(actor, [now, 1]);
-      // 顺手清理过期项，防 Map 无限膨胀
-      if (uploadRateMap.size > 10000) {
-        for (const [k, v] of uploadRateMap) {
-          if (now - v[0] > RATE_WINDOW_MS) uploadRateMap.delete(k);
-        }
-      }
-      return true;
-    }
-    entry[1]++;
-    return entry[1] <= UPLOAD_RATE_MAX;
+    return uploadLimiter.allowed(actor);
   }
   // 鉴权：内部令牌（Next 服务端转发）或用户身份（网关注入的 x-actor-email）满足其一
   function uploadAuthOk(req) {

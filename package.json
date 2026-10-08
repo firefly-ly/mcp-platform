@@ -7,6 +7,7 @@
   "scripts": {
     "start": "node server.js",
     "lint": "eslint .",
+    "test:unit": "node --test test/unit/",
     "check:split": "node scripts/check-split-integrity.js",
     "test:smoke": "node scripts/smoke-test.js",
     "test:security": "node scripts/security-test.js"
