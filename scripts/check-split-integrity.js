@@ -11,7 +11,9 @@ const serverSrc = fs.readFileSync(path.join(ROOT, "server.js"), "utf8");
 // ---------- 1. Proxy 实测各模块访问的 ctx 字段 ----------
 const MODS = [
   "routes/favorites.js", "routes/stats.js", "routes/issues.js", "routes/audit.js",
-  "routes/skills.js", "routes/mcp.js", "routes/submissions.js", "services/deploy.js",
+  "routes/skills.js", "routes/mcp.js", "routes/submissions.js",
+  "routes/submission-upload.js", "routes/submission-env.js",
+  "services/deploy.js",
 ];
 const need = {};
 for (const f of MODS) {

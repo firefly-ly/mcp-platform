@@ -1085,6 +1085,18 @@ require("./routes/submissions")(app, {
   RATE_WINDOW_MS, RATE_MAX, DUP_STATUSES, INTERNAL_PROXY_TOKEN,
   MCP_TREE_MAX, MAX_BUFFER, MAX_TAR_UPLOAD_MB, MAX_TAR_UPLOAD_BYTES,
 });
+// 2026-10-08 拆分第五刀：上传域与 .env 配置域自 submissions 拆出，共享同一份装配块
+require("./routes/submission-upload")(app, {
+  ...CTX,
+  actorFromReq, audit, deniedThrottled, stagingKey, sanitizeUploadName,
+  ensureGroupMeta, runSubmissionScans, TAR_ROOT,
+  RATE_WINDOW_MS, INTERNAL_PROXY_TOKEN,
+  MAX_TAR_UPLOAD_MB, MAX_TAR_UPLOAD_BYTES,
+});
+require("./routes/submission-env")(app, {
+  ...CTX,
+  storeSubmissionEnv,
+});
 
 // 显式绑 0.0.0.0：WSL2 下 localhost 常解析到 127.0.0.1，
 // 若只绑默认的 IPv6 :: 会导致 curl localhost 连接被拒。
