@@ -7,10 +7,11 @@
   "scripts": {
     "start": "node server.js",
     "lint": "eslint .",
-    "test:unit": "node --test test/unit/",
+    "test:unit": "node --test \"test/unit/*.test.js\"",
     "check:split": "node scripts/check-split-integrity.js",
     "test:smoke": "node scripts/smoke-test.js",
-    "test:security": "node scripts/security-test.js"
+    "test:security": "node scripts/security-test.js",
+    "prepare": "husky"
   },
   "dependencies": {
     "better-sqlite3": "^11.3.0",
@@ -18,8 +19,11 @@
     "express": "^4.19.2"
   },
   "devDependencies": {
+    "@commitlint/cli": "^21.2.3",
+    "@commitlint/config-conventional": "^21.2.3",
     "@eslint/js": "^10.0.1",
     "eslint": "^10.10.0",
-    "globals": "^17.12.0"
+    "globals": "^17.12.0",
+    "husky": "^9.1.7"
   }
 }
