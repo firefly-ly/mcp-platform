@@ -21,6 +21,7 @@ const { execFileHidden, safeExec } = require("./lib/exec");
 const http = require("http");
 const zlib = require("zlib");
 const objStore = require("./object-store");
+const log = require("./lib/logger"); // 统一日志：时间戳 + 级别（lib/logger.js）
 const { parseVisibility, isOnShelf, canAccessSubmission } = require("./lib/visibility");
 
 // 内置 .env 加载（不依赖 dotenv）：仅填充未设置的环境变量，已导出的优先
@@ -143,9 +144,9 @@ function seedIfEmpty() {
       }
     });
 
-    console.log("已写入 demo skill / mcp 与指标种子数据");
+    log.info("已写入 demo skill / mcp 与指标种子数据");
   } catch (e) {
-    console.warn("种子数据写入失败（可忽略，不影响运行）:", e.message);
+    log.warn("种子数据写入失败（可忽略，不影响运行）:", e.message);
   }
 }
 seedIfEmpty();
@@ -646,7 +647,7 @@ function publicBase(req) {
 }
 // 启动时告警一次：回退 localhost 意味着跨机器不可达，提醒部署者显式声明基址
 if (!process.env.PUBLIC_BASE && !getLanIp()) {
-  console.warn(
+  log.warn(
     "[publicBase] 未设置 PUBLIC_BASE 且未探测到真实内网 IP：对外地址回退 localhost（仅本机可用）。跨机器访问请设置 PUBLIC_BASE，如 http://<Windows局域网IP>:4000",
   );
 }
@@ -775,11 +776,11 @@ async function registryPublish(id) {
     } else {
       const txt = await res.text();
       patchMeta(id, { registry_synced: "error", registry_sync_error: "HTTP " + res.status + " " + txt.slice(0, 300) });
-      console.error("[registry] publish 失败", id, res.status, txt.slice(0, 200));
+      log.error("[registry] publish 失败", id, res.status, txt.slice(0, 200));
     }
   } catch (e) {
     patchMeta(id, { registry_synced: "error", registry_sync_error: String((e && e.message) || e).slice(0, 300) });
-    console.error("[registry] publish 异常", id, e && e.message);
+    log.error("[registry] publish 异常", id, e && e.message);
   }
 }
 
@@ -800,11 +801,11 @@ async function registryDelete(id) {
     } else {
       const txt = await res.text();
       patchMeta(id, { registry_synced: "delete-error", registry_sync_error: "HTTP " + res.status + " " + txt.slice(0, 300) });
-      console.error("[registry] delete 失败", id, res.status, txt.slice(0, 200));
+      log.error("[registry] delete 失败", id, res.status, txt.slice(0, 200));
     }
   } catch (e) {
     patchMeta(id, { registry_synced: "delete-error", registry_sync_error: String((e && e.message) || e).slice(0, 300) });
-    console.error("[registry] delete 异常", id, e && e.message);
+    log.error("[registry] delete 异常", id, e && e.message);
   }
 }
 
@@ -845,7 +846,7 @@ async function promoteArtifact(stagingK, group, version, filename) {
 if (process.env.TRUST_GATEWAY === "1") {
   const GATEWAY_TOKEN = process.env.GATEWAY_TOKEN;
   if (!GATEWAY_TOKEN) {
-    console.error("拒绝启动：TRUST_GATEWAY=1 必须显式设置 GATEWAY_TOKEN（强随机值，如 openssl rand -hex 32）。");
+    log.error("拒绝启动：TRUST_GATEWAY=1 必须显式设置 GATEWAY_TOKEN（强随机值，如 openssl rand -hex 32）。");
     process.exit(1);
   }
   app.use((req, res, next) => {
@@ -853,7 +854,7 @@ if (process.env.TRUST_GATEWAY === "1") {
     if (req.headers["x-gateway-token"] === GATEWAY_TOKEN) return next();
     return res.status(403).json({ error: "forbidden: gateway token required" });
   });
-  console.log("[安全] 网关信任模式已开启：除 /health 外所有请求需携带 X-Gateway-Token");
+  log.info("[安全] 网关信任模式已开启：除 /health 外所有请求需携带 X-Gateway-Token");
 }
 
 // POST /upload/tar 已迁至 routes/submissions.js（2026-09-12，上传域归位）。
@@ -894,11 +895,11 @@ fs.mkdirSync(ARTIFACT_FS_ROOT, { recursive: true });
 const INTERNAL_PROXY_TOKEN_SET = Boolean(process.env.INTERNAL_PROXY_TOKEN);
 const INTERNAL_PROXY_TOKEN = process.env.INTERNAL_PROXY_TOKEN || "thv-internal-proxy";
 if (process.env.NODE_ENV === "production" && !INTERNAL_PROXY_TOKEN_SET) {
-  console.error("拒绝启动：生产环境必须显式设置 INTERNAL_PROXY_TOKEN（强随机值），否则 staging 制品可被任意下载。");
+  log.error("拒绝启动：生产环境必须显式设置 INTERNAL_PROXY_TOKEN（强随机值），否则 staging 制品可被任意下载。");
   process.exit(1);
 }
 if (!INTERNAL_PROXY_TOKEN_SET) {
-  console.warn("[安全警告] INTERNAL_PROXY_TOKEN 未配置，使用弱默认值（仅限本地开发）。生产部署前必须显式配置。");
+  log.warn("[安全警告] INTERNAL_PROXY_TOKEN 未配置，使用弱默认值（仅限本地开发）。生产部署前必须显式配置。");
 }
 const artifactStatic = express.static(ARTIFACT_FS_ROOT);
 app.use("/artifacts", (req, res, next) => {
@@ -1064,7 +1065,7 @@ if (process.env.MCP_PROXY_PUBLIC_DISABLED !== "1") {
     mcpProxyHandler(req, res, { forceToken: true }),
   );
   proxyApp.listen(PROXY_PORT, PROXY_HOST, () =>
-    console.log(
+    log.info(
       `对外 MCP 代理已监听: ${PROXY_HOST}:${PROXY_PORT}（仅 /mcp-proxy，强制 Token 校验）`,
     ),
   );
@@ -1126,12 +1127,12 @@ app.post("/admin/registry-resync", async (req, res) => {
 });
 
 const server = app.listen(PORT, HOST, () =>
-  console.log(
+  log.info(
     `平台后端已启动: http://localhost:${PORT} (${HOST}:${PORT})`,
   ),
 );
 server.on("error", (err) => {
-  console.error("监听失败（端口可能被占用或权限不足）:", err);
+  log.error("监听失败（端口可能被占用或权限不足）:", err);
   process.exit(1);
 });
 
@@ -1152,7 +1153,7 @@ function requeueStuckScans() {
       n++;
     }
   }
-  if (n) console.log(`[scan] 启动对账：${n} 条提交卡在扫描中，已重新排队`);
+  if (n) log.info(`[scan] 启动对账：${n} 条提交卡在扫描中，已重新排队`);
 }
 requeueStuckScans();
 
@@ -1166,7 +1167,7 @@ async function selfHealIngresses() {
   if (healing) return;
   healing = true;
   try {
-    await reconcileMcpWorkloads().catch((e) => console.error("[workload 对账] 异常:", e.message));
+    await reconcileMcpWorkloads().catch((e) => log.error("[workload 对账] 异常:", e.message));
     const now = Date.now();
     const rows = db.prepare("SELECT id FROM submissions WHERE type='mcp'").all();
     for (const r of rows) {
@@ -1206,9 +1207,9 @@ function backupDatabase() {
     while (files.length > BACKUP_KEEP) {
       try { fs.unlinkSync(path.join(BACKUP_DIR, files.shift())); } catch (_) { break; }
     }
-    console.log("[维护] 数据库备份完成:", dest);
+    log.info("[维护] 数据库备份完成:", dest);
   } catch (e) {
-    console.error("[维护] 数据库备份失败:", e.message);
+    log.error("[维护] 数据库备份失败:", e.message);
   }
 }
 // metric_events 是无限增长的埋点表（只有 INSERT 没有清理），且列表页/stats 会全表聚合——
@@ -1217,9 +1218,9 @@ function pruneMetricEvents() {
   try {
     const cutoff = new Date(Date.now() - 90 * 24 * 3600 * 1000).toISOString();
     const info = db.prepare("DELETE FROM metric_events WHERE occurred_at < ?").run(cutoff);
-    if (info.changes > 0) console.log(`[维护] metric_events 清理 ${info.changes} 条（>90 天）`);
+    if (info.changes > 0) log.info(`[维护] metric_events 清理 ${info.changes} 条（>90 天）`);
   } catch (e) {
-    console.error("[维护] metric_events 清理失败:", e.message);
+    log.error("[维护] metric_events 清理失败:", e.message);
   }
 }
 function runDailyMaintenance() { backupDatabase(); pruneMetricEvents(); }
@@ -1251,17 +1252,17 @@ setInterval(runDailyMaintenance, 24 * 3600 * 1000).unref();
       } else {
         patchMeta(r.id, { deploy_status: "failed", deploy_error: "服务重启中断部署，workload 不在运行。请点击「重新部署」重试。" });
       }
-      console.log("[启动恢复] 处理卡死的部署:", r.id);
+      log.info("[启动恢复] 处理卡死的部署:", r.id);
     }
   } catch (e) {
-    console.error("[启动恢复] 失败:", e.message);
+    log.error("[启动恢复] 失败:", e.message);
   }
 })();
 
 // 优雅退出：先关监听、再关 db，让 SQLite 正常 checkpoint WAL，
 // 避免被 pkill/SIGTERM 强杀时留下"热 WAL"导致下次启动挂起（D 态）。
 function shutdown(signal) {
-  console.log(`收到 ${signal}，正在优雅关闭...`);
+  log.info(`收到 ${signal}，正在优雅关闭...`);
   server.close(() => {
     try { db.close(); } catch (_) {} // 优雅关闭路径 DB 可能已关闭，二次 close 报错无需处理
     process.exit(0);
