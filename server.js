@@ -299,32 +299,13 @@ function normName(n) {
 // tar 路径不走内网 registry：加载后镜像已在本地 daemon，deployMcp 直接运行它。
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-// 从 payload_ref / meta 提取 group_key 与 version。
+// 从 payload_ref / meta 提取 group_key 与 version（纯函数，含单测）。
 // payload_ref 如 dws-explorer:1.0.0 / dws-explorer 1.0.0 / dws-explorer-v1.0.0
 // → group=dws-explorer, version=1.0.0
 // 没有显式版本时默认 1.0.0，group_key 回退到 name 或 payload_ref 或 id。
-function extractGroupAndVersion(sub) {
-  const meta = parseMeta(sub);
-  let group_key = (meta.group_key || "").trim();
-  let version = (meta.version || "").trim();
-  const ref = (sub.payload_ref || "").trim();
-  if (!version) {
-    // 尝试从 ref 末尾取 semver：xxx:1.2.3 或 xxx-v1.2.3
-    const m = ref.match(/(?:^|[\s:\-_/]|[_-]v?V?)(\d+\.\d+\.\d+(?:[-+.]\w+)*)(?:\s*|:?$)/);
-    if (m) version = m[1];
-  }
-  if (!group_key) {
-    // 去掉版本后缀
-    const base = ref
-      .replace(/[\s:\-_/]?v?V?\d+\.\d+\.\d+(?:[-+.]\w*)*(?:\s*|:?$)/, "")
-      .replace(/[\s:\-_/]+$/, "");
-    group_key = base || meta.name || ref || sub.id;
-  }
-  return {
-    group_key: slugify(group_key).replace(/[^a-z0-9._-]/g, "-").replace(/^-+|-+$/g, ""),
-    version: version || "1.0.0",
-  };
-}
+// 2026-10-08 抽至 lib/group-version.js：兼容全角标点（全角冒号/全角空格/全角横线）与分隔符后 v/V 前缀，
+// 返回值新增 version_source（meta|ref|fallback）标记版本来源，供 ensureGroupMeta 兜底留痕。
+const { extractGroupAndVersion } = require("./lib/group-version");
 
 // 确保 meta 里有 group_key / version，并写回 DB
 function ensureGroupMeta(sub) {
@@ -332,6 +313,21 @@ function ensureGroupMeta(sub) {
   if (meta.group_key && meta.version) return { group_key: meta.group_key, version: meta.version };
   const gv = extractGroupAndVersion(sub);
   patchMeta(sub.id, { group_key: gv.group_key, version: gv.version });
+  // 版本提取失败兜底 1.0.0 时留痕（此前是静默兜底，界面显示 1.0.0 无从追溯）
+  if (gv.version_source === "fallback") {
+    try {
+      log.warn("version_fallback: 无法从 meta/payload_ref 提取版本，兜底 1.0.0",
+        { submission_id: sub.id, payload_ref: sub.payload_ref || "" });
+      audit(
+        { headers: { "x-actor-email": "system@bootstrap" } },
+        "version_fallback", sub.type || "submission", sub.id,
+        { payload_ref: sub.payload_ref || "" },
+      );
+    } catch (e) {
+      log.warn("version_fallback_audit_failed",
+        { submission_id: sub.id, error: String((e && e.message) || e) });
+    }
+  }
   return gv;
 }
 
