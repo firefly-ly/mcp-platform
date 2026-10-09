@@ -8,7 +8,10 @@ backups/
 object-store/
 
 # ===== 大体积二进制/制品 =====
-tools/
+# tools/* 而非 tools/：目录本身不入库但保留例外（docker-config 是 thv 弹窗修复的一部分）
+tools/*
+!tools/docker-config/
+!tools/docker-config/config.json
 *.tar
 *.tar.gz
 *.tgz
