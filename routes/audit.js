@@ -4,11 +4,13 @@ module.exports = function registerAuditRoutes(app, ctx) {
   const { db, actorFromReq } = ctx;
 
   // 统一审计轨迹查询（仅管理员）。过滤：actor / action / target_id / from / to（ISO 日期）。
+  // 分页：limit（默认 50，≤200）+ offset；total 返回 WHERE 命中总数（区别于 count=本页条数）。
   app.get("/audit", (req, res) => {
     const actor = actorFromReq(req);
     if (!actor.admin) return res.status(403).json({ error: "仅管理员可查询审计轨迹" });
     const { actor: filterActor, action, target_id, from, to } = req.query;
-    const limit = Math.min(Number(req.query.limit) || 200, 1000);
+    const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
+    const offset = Math.max(Number(req.query.offset) || 0, 0);
     const conds = [];
     const params = [];
     if (filterActor) { conds.push("actor_email LIKE ?"); params.push("%" + filterActor + "%"); }
@@ -17,9 +19,12 @@ module.exports = function registerAuditRoutes(app, ctx) {
     if (from) { conds.push("ts >= ?"); params.push(String(from)); }
     if (to) { conds.push("ts <= ?"); params.push(String(to)); }
     const where = conds.length ? "WHERE " + conds.join(" AND ") : "";
+    const total = db.prepare(
+      `SELECT COUNT(*) c FROM audit_logs ${where}`
+    ).get(...params).c;
     const rows = db.prepare(
-      `SELECT * FROM audit_logs ${where} ORDER BY ts DESC LIMIT ?`
-    ).all(...params, limit);
-    res.json({ count: rows.length, items: rows });
+      `SELECT * FROM audit_logs ${where} ORDER BY ts DESC LIMIT ? OFFSET ?`
+    ).all(...params, limit, offset);
+    res.json({ count: rows.length, total, limit, offset, items: rows });
   });
 };
