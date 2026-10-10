@@ -8,6 +8,13 @@ module.exports = function registerFavoritesRoutes(app, ctx) {
     const { user_id, item_type, item_ref } = req.body || {};
     if (!user_id || !item_type || !item_ref)
       return res.status(400).json({ error: "user_id, item_type, item_ref 必填" });
+    // 幂等：同一 (user, item) 已收藏时直接返回既有记录，防连点重复插入
+    const existing = db
+      .prepare(
+        "SELECT id FROM favorites WHERE user_id=? AND item_type=? AND item_ref=?",
+      )
+      .get(user_id, item_type, item_ref);
+    if (existing) return res.json({ id: existing.id, existed: true });
     const id = "fav_" + Date.now();
     db.prepare("INSERT INTO favorites VALUES(?,?,?,?,?)")
       .run(id, user_id, item_type, item_ref, new Date().toISOString());
