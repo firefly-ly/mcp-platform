@@ -7,6 +7,7 @@
 const crypto = require("node:crypto");
 const http = require("node:http");
 const express = require("express");
+const { parseVisibility, memberTokenAllowed } = require("../lib/visibility");
 
 module.exports = function registerMcpRoutes(app, ctx) {
   const {
@@ -19,6 +20,29 @@ module.exports = function registerMcpRoutes(app, ctx) {
     workloadNameFor, servePackageFile, execFileHidden, MAX_BUFFER,
     inspectSkillPackage, MCP_TREE_MAX,
   } = ctx;
+
+  // ---- 成员级代理 Token（双轨制 2026-10-13）----
+  // 按调用者身份出代理凭证（D1 成员视角）：
+  //  - admin / LIVE_MCPS（无 submission）/ mode=all 条目 → 包级 token（现状不变；
+  //    mode=all 发包级是既有语义：4100 对外口强制 token，且管理员后续切 restricted 时存量配置仍有效）；
+  //  - restricted 条目非管理员 → 只发自己的成员 token（未签发则不出 headers，置 mcp_token_required=true，
+  //    前端复制配置弹窗提示「联系管理员签发」）——包级 token 不再下发给普通成员（D1=A：防踢人后被包级配置绕过）。
+  // 返回 { headers, tokenRequired }：headers 供 mcp_headers 字段，tokenRequired 供前端区分「无凭证」与「未签发」。
+  function mcpHeadersForActor(s, actor) {
+    const meta = parseMeta(s);
+    const workload = meta.workload_name || workloadNameFor(s.id);
+    const headers = mcpAuthHeadersFor(workload); // 副作用：确保包级 token 存在（管理员/存量路径依赖）
+    if (!headers) return { headers: undefined, tokenRequired: false };
+    if (actor.admin) return { headers, tokenRequired: false };
+    const vis = parseVisibility(meta);
+    if (vis.mode !== "restricted") return { headers, tokenRequired: false };
+    const member = String(actor.email || "").toLowerCase().trim();
+    const mt = member
+      ? db.prepare("SELECT token FROM mcp_member_tokens WHERE submission_id=? AND member=?").get(s.id, member)
+      : null;
+    if (mt) return { headers: { Authorization: `Bearer ${mt.token}` }, tokenRequired: false };
+    return { headers: undefined, tokenRequired: true };
+  }
 
   // ---- 实例运行时缓存（SWR）：ingress 端点发现（docker 查询）+ 真实探活 ----
   // /mcp 列表与 /mcp/:id 每次都对每个实例做 docker 查询 + HTTP 探活（各 ~450ms），
@@ -177,9 +201,9 @@ module.exports = function registerMcpRoutes(app, ctx) {
             row.endpoint,
             req,
           );
-          row.mcp_headers = mcpAuthHeadersFor(
-            parseMeta(s).workload_name || workloadNameFor(s.id),
-          );
+          const { headers: actorTokenHeaders, tokenRequired } = mcpHeadersForActor(s, actor);
+          row.mcp_headers = actorTokenHeaders;
+          if (tokenRequired) row.mcp_token_required = true;
         }
       }
       return row;
@@ -356,9 +380,9 @@ module.exports = function registerMcpRoutes(app, ctx) {
           row.endpoint,
           req,
         );
-        row.mcp_headers = mcpAuthHeadersFor(
-          parseMeta(s).workload_name || workloadNameFor(s.id),
-        );
+        const { headers: actorTokenHeaders, tokenRequired } = mcpHeadersForActor(s, actorFromReq(req));
+        row.mcp_headers = actorTokenHeaders;
+        if (tokenRequired) row.mcp_token_required = true;
       }
     }
     res.json(row);
@@ -456,6 +480,8 @@ module.exports = function registerMcpRoutes(app, ctx) {
   // 轮换代理访问令牌（仅管理员，仅 MCP）：生成新 mcp_token 覆盖旧值。
   // 旧 Token 立即作废——所有已复制到客户端的接入配置会 401，需重新复制配置；
   // 其他 MCP 不受影响（token 本就是 per-MCP 一把）。写审计轨迹备查。
+  // 双轨制说明（2026-10-13）：本路由轮换的是「包级」token，全员失效；
+  // 按成员轮换走 POST /submissions/:id/member-tokens（只影响单个成员）。
   app.post("/submissions/:id/rotate-token", (req, res) => {
     const actor = actorFromReq(req);
     if (!actor.admin) return res.status(403).json({ error: "仅管理员可轮换 Token" });
@@ -465,8 +491,108 @@ module.exports = function registerMcpRoutes(app, ctx) {
     if (sub.type !== "mcp") return res.status(400).json({ error: "只有 MCP 有代理 Token" });
     const token = crypto.randomBytes(16).toString("hex");
     patchMeta(id, { mcp_token: token });
-    audit(req, "token_rotate", "mcp", id, {});
+    audit(req, "token_rotate", "mcp", id, { scope: "package" });
     res.json({ ok: true, id });
+  });
+
+  // ---- 成员级代理 Token 管理（双轨制，仅管理员，仅 MCP）----
+  // 成员 token 与包级 token 并行有效：签发/轮换/吊销成员 token 只影响该成员的接入配置。
+  // member 必须在条目可见范围 users（按邮箱授权名单）内——D2 决策：groups 授权不参与成员 token。
+
+  // 列表：可见范围 users × 各自签发状态（token 一并返回，管理员可直接复制成员专属配置）
+  app.get("/submissions/:id/member-tokens", (req, res) => {
+    const actor = actorFromReq(req);
+    if (!actor.admin) return res.status(403).json({ error: "仅管理员可查看成员 Token" });
+    const sub = db.prepare("SELECT * FROM submissions WHERE id=?").get(req.params.id);
+    if (!sub) return res.status(404).json({ error: "submission 不存在" });
+    if (sub.type !== "mcp") return res.status(400).json({ error: "只有 MCP 有代理 Token" });
+    const vis = parseVisibility(parseMeta(sub));
+    if (vis.mode !== "restricted") {
+      return res.json({ ok: true, mode: "all", members: [] });
+    }
+    const rows = db
+      .prepare("SELECT member, token, created_at, rotated_at FROM mcp_member_tokens WHERE submission_id=?")
+      .all(sub.id);
+    const byEmail = {};
+    rows.forEach((r) => { byEmail[r.member] = r; });
+    const members = vis.users.map((u) => ({
+      member: u,
+      token: byEmail[u] ? byEmail[u].token : null,
+      created_at: byEmail[u] ? byEmail[u].created_at : null,
+      rotated_at: byEmail[u] ? byEmail[u].rotated_at : null,
+    }));
+    res.json({ ok: true, mode: "restricted", members });
+  });
+
+  // 签发 / 轮换（body: {member}）。已签发 → 轮换（旧 token 立即作废）；未签发 → 签发。
+  app.post("/submissions/:id/member-tokens", (req, res) => {
+    const actor = actorFromReq(req);
+    if (!actor.admin) return res.status(403).json({ error: "仅管理员可签发成员 Token" });
+    const sub = db.prepare("SELECT * FROM submissions WHERE id=?").get(req.params.id);
+    if (!sub) return res.status(404).json({ error: "submission 不存在" });
+    if (sub.type !== "mcp") return res.status(400).json({ error: "只有 MCP 有代理 Token" });
+    const member = String((req.body && req.body.member) || "").toLowerCase().trim();
+    if (!member) return res.status(400).json({ error: "缺少 member（成员邮箱）" });
+    if (!memberTokenAllowed(parseMeta(sub), member)) {
+      return res.status(422).json({
+        error: "该成员不在条目可见范围（按邮箱授权名单）内，请先在「可见范围」中添加",
+      });
+    }
+    const now = new Date().toISOString();
+    const existing = db
+      .prepare("SELECT token FROM mcp_member_tokens WHERE submission_id=? AND member=?")
+      .get(sub.id, member);
+    const token = crypto.randomBytes(16).toString("hex");
+    if (existing) {
+      db.prepare("UPDATE mcp_member_tokens SET token=?, rotated_at=? WHERE submission_id=? AND member=?")
+        .run(token, now, sub.id, member);
+      audit(req, "token_rotate", "mcp", sub.id, { scope: "member", member });
+    } else {
+      db.prepare("INSERT INTO mcp_member_tokens VALUES(?,?,?,?,?)")
+        .run(sub.id, member, token, now, null);
+      audit(req, "token_issue", "mcp", sub.id, { scope: "member", member });
+    }
+    res.json({ ok: true, id: sub.id, member, token });
+  });
+
+  // 吊销（成员 token 立即作废；该成员接入配置 401，需管理员重新签发）
+  app.delete("/submissions/:id/member-tokens/:member", (req, res) => {
+    const actor = actorFromReq(req);
+    if (!actor.admin) return res.status(403).json({ error: "仅管理员可吊销成员 Token" });
+    const sub = db.prepare("SELECT * FROM submissions WHERE id=?").get(req.params.id);
+    if (!sub) return res.status(404).json({ error: "submission 不存在" });
+    if (sub.type !== "mcp") return res.status(400).json({ error: "只有 MCP 有代理 Token" });
+    const member = String(req.params.member || "").toLowerCase().trim();
+    const info = db
+      .prepare("DELETE FROM mcp_member_tokens WHERE submission_id=? AND member=?")
+      .run(sub.id, member);
+    if (info.changes > 0) {
+      audit(req, "token_revoke", "mcp", sub.id, { scope: "member", member });
+    }
+    res.json({ ok: true, id: sub.id, member, revoked: info.changes > 0 });
+  });
+
+  // 成员专属接入配置（仅管理员）：publicEndpointFor + 该成员 token 的 Authorization 头，
+  // 供「Token 管理」弹窗一键复制，免去前端自行拼对外地址。
+  app.get("/submissions/:id/member-token-config", (req, res) => {
+    const actor = actorFromReq(req);
+    if (!actor.admin) return res.status(403).json({ error: "仅管理员可获取成员接入配置" });
+    const sub = db.prepare("SELECT * FROM submissions WHERE id=?").get(req.params.id);
+    if (!sub) return res.status(404).json({ error: "submission 不存在" });
+    if (sub.type !== "mcp") return res.status(400).json({ error: "只有 MCP 有代理 Token" });
+    const member = String(req.query.member || "").toLowerCase().trim();
+    const row = db
+      .prepare("SELECT token FROM mcp_member_tokens WHERE submission_id=? AND member=?")
+      .get(sub.id, member);
+    if (!row) return res.status(404).json({ error: "该成员尚未签发 Token" });
+    const meta = parseMeta(sub);
+    const endpoint = meta.endpoint || null;
+    if (!endpoint) return res.json({ ok: true, url: null, headers: null });
+    return res.json({
+      ok: true,
+      url: publicEndpointFor(meta.workload_name || workloadNameFor(sub.id), endpoint, req),
+      headers: { Authorization: `Bearer ${row.token}` },
+    });
   });
 
   // 供 server.js 的 deploy/undeploy 在部署事件时双清两层缓存；

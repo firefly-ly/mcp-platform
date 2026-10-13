@@ -96,6 +96,22 @@ try {
   db.exec("CREATE INDEX IF NOT EXISTS idx_audit_lookup ON audit_logs(action, target_type, target_id, ts);");
 } catch (_) {} // 同上：audit 索引创建失败不阻断启动
 
+// 成员级代理 Token（双轨制，2026-10-13）：restricted MCP 可按 email 为成员签发独立访问令牌，
+// 轮换/吊销只影响该成员；包级 mcp_token 保留并行有效（兼容存量已复制配置）。
+// proxy 校验时实时复查 member 是否仍在条目可见范围 users 内——移出可见范围即刻失效。
+try {
+  db.exec(`CREATE TABLE IF NOT EXISTS mcp_member_tokens(
+    submission_id TEXT NOT NULL,
+    member TEXT NOT NULL,
+    token TEXT NOT NULL,
+    created_at TEXT,
+    rotated_at TEXT,
+    PRIMARY KEY(submission_id, member)
+  )`);
+  // proxy 每次请求按 token 反查（不见 submission_id），组合索引避免全表扫
+  db.exec("CREATE INDEX IF NOT EXISTS idx_member_tokens_token ON mcp_member_tokens(token, submission_id);");
+} catch (_) {} // 建表/索引失败不阻断启动（与 audit 同策略）
+
 // 首次运行种子：已审批的 demo skill + demo mcp + 一些 demo 指标事件
 function seedIfEmpty() {
   try {

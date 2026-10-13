@@ -1,9 +1,11 @@
-// 可见性判定单测：canAccessSubmission / isOnShelf / parseVisibility（lib/visibility.js）
+// 可见性判定单测：canAccessSubmission / isOnShelf / parseVisibility / memberTokenAllowed（lib/visibility.js）
 // 运行：npm run test:unit
 "use strict";
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
-const { parseVisibility, isOnShelf, canAccessSubmission } = require("../../lib/visibility");
+const {
+  parseVisibility, isOnShelf, canAccessSubmission, memberTokenAllowed,
+} = require("../../lib/visibility");
 
 const user = (email, groups = [], admin = false) => ({ email, groups, admin });
 
@@ -59,4 +61,34 @@ test("canAccessSubmission：restricted 按组白名单命中", () => {
   assert.equal(canAccessSubmission(meta, user("a@x.com", ["qa", "dev"])), true);
   assert.equal(canAccessSubmission(meta, user("a@x.com", ["qa"])), false);
   assert.equal(canAccessSubmission(meta, user("a@x.com")), false);
+});
+
+// ---- 成员级代理 Token（双轨制 2026-10-13）----
+
+test("memberTokenAllowed：restricted + 在 users 名单内 → 可用", () => {
+  const meta = { visibility: { mode: "restricted", users: ["a@x.com"], groups: [] } };
+  assert.equal(memberTokenAllowed(meta, "a@x.com"), true);
+});
+
+test("memberTokenAllowed：restricted 但不在 users 名单内 → 不可用（防移出可见范围后旧 token 存活）", () => {
+  const meta = { visibility: { mode: "restricted", users: ["a@x.com"], groups: [] } };
+  assert.equal(memberTokenAllowed(meta, "b@x.com"), false);
+});
+
+test("memberTokenAllowed：mode=all 一律不可用（成员 token 仅 restricted 语义）", () => {
+  assert.equal(memberTokenAllowed({}, "a@x.com"), false);
+  assert.equal(memberTokenAllowed({ visibility: { mode: "all" } }, "a@x.com"), false);
+});
+
+test("memberTokenAllowed：groups 命中不算（D2：groups 授权不参与成员 token，按组授权走包级）", () => {
+  const meta = { visibility: { mode: "restricted", users: [], groups: ["dev"] } };
+  assert.equal(memberTokenAllowed(meta, "a@x.com"), false);
+});
+
+test("memberTokenAllowed：member 大小写/空白归一化，空值拒绝", () => {
+  const meta = { visibility: { mode: "restricted", users: ["a@x.com"], groups: [] } };
+  assert.equal(memberTokenAllowed(meta, " A@X.COM "), true);
+  assert.equal(memberTokenAllowed(meta, ""), false);
+  assert.equal(memberTokenAllowed(meta, null), false);
+  assert.equal(memberTokenAllowed(meta, undefined), false);
 });
