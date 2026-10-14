@@ -499,29 +499,33 @@ module.exports = function registerMcpRoutes(app, ctx) {
   // 成员 token 与包级 token 并行有效：签发/轮换/吊销成员 token 只影响该成员的接入配置。
   // member 必须在条目可见范围 users（按邮箱授权名单）内——D2 决策：groups 授权不参与成员 token。
 
-  // 列表：可见范围 users × 各自签发状态（token 一并返回，管理员可直接复制成员专属配置）
+  // 列表：可见范围 users × 各自签发状态（token 一并返回，管理员可直接复制成员专属配置）。
+  // 2026-10-14：任何模式都返回名单（mode=all 的名单 = 已自助签发/管理员添加的成员，
+  // 名单在切模式时保留）——读原始 meta.visibility.users，不能用 parseVisibility
+  // （其在 mode=all 时丢弃名单）。
   app.get("/submissions/:id/member-tokens", (req, res) => {
     const actor = actorFromReq(req);
     if (!actor.admin) return res.status(403).json({ error: "仅管理员可查看成员 Token" });
     const sub = db.prepare("SELECT * FROM submissions WHERE id=?").get(req.params.id);
     if (!sub) return res.status(404).json({ error: "submission 不存在" });
     if (sub.type !== "mcp") return res.status(400).json({ error: "只有 MCP 有代理 Token" });
-    const vis = parseVisibility(parseMeta(sub));
-    if (vis.mode !== "restricted") {
-      return res.json({ ok: true, mode: "all", members: [] });
-    }
+    const meta = parseMeta(sub);
+    const rawVis = meta.visibility || {};
+    const users = (Array.isArray(rawVis.users) ? rawVis.users : [])
+      .map((u) => String(u).toLowerCase().trim())
+      .filter(Boolean);
     const rows = db
       .prepare("SELECT member, token, created_at, rotated_at FROM mcp_member_tokens WHERE submission_id=?")
       .all(sub.id);
     const byEmail = {};
     rows.forEach((r) => { byEmail[r.member] = r; });
-    const members = vis.users.map((u) => ({
+    const members = users.map((u) => ({
       member: u,
       token: byEmail[u] ? byEmail[u].token : null,
       created_at: byEmail[u] ? byEmail[u].created_at : null,
       rotated_at: byEmail[u] ? byEmail[u].rotated_at : null,
     }));
-    res.json({ ok: true, mode: "restricted", members });
+    res.json({ ok: true, mode: rawVis.mode === "restricted" ? "restricted" : "all", members });
   });
 
   // 签发 / 轮换（body: {member}）。已签发 → 轮换（旧 token 立即作废）；未签发 → 签发。
@@ -533,10 +537,28 @@ module.exports = function registerMcpRoutes(app, ctx) {
     if (sub.type !== "mcp") return res.status(400).json({ error: "只有 MCP 有代理 Token" });
     const member = String((req.body && req.body.member) || "").toLowerCase().trim();
     if (!member) return res.status(400).json({ error: "缺少 member（成员邮箱）" });
-    if (!memberTokenAllowed(parseMeta(sub), member)) {
-      return res.status(422).json({
-        error: "该成员不在条目可见范围（按邮箱授权名单）内，请先在「可见范围」中添加",
+    // 管理员签发：名单内直接走 memberTokenAllowed；名单外（mode=all 下给新成员代签）
+    // 自动把成员并入 users 再签发（audit 记 visibility_adopt_member）。
+    let meta = parseMeta(sub);
+    if (!memberTokenAllowed(meta, member)) {
+      if (!actor.admin) {
+        return res.status(422).json({
+          error: "该成员不在条目可见范围（按邮箱授权名单）内，请先在「可见范围」中添加",
+        });
+      }
+      const rawVis = meta.visibility || {};
+      const curUsers = (Array.isArray(rawVis.users) ? rawVis.users : [])
+        .map((u) => String(u).toLowerCase().trim()).filter(Boolean);
+      patchMeta(sub.id, {
+        visibility: {
+          mode: rawVis.mode === "restricted" ? "restricted" : "all",
+          users: [...new Set([...curUsers, member])].sort(),
+          groups: Array.isArray(rawVis.groups) ? rawVis.groups : [],
+        },
+        visibility_configured: true,
       });
+      audit(req, "visibility_adopt_member", "mcp", sub.id, { member });
+      // 名单已落库；本路由后续只用 sub.id，无需重读 meta
     }
     const now = new Date().toISOString();
     const existing = db

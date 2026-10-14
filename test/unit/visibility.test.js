@@ -75,9 +75,20 @@ test("memberTokenAllowed：restricted 但不在 users 名单内 → 不可用（
   assert.equal(memberTokenAllowed(meta, "b@x.com"), false);
 });
 
-test("memberTokenAllowed：mode=all 一律不可用（成员 token 仅 restricted 语义）", () => {
-  assert.equal(memberTokenAllowed({}, "a@x.com"), false);
+test("memberTokenAllowed：mode=all 下名单内可用（2026-10-14 凭证解耦——读原始名单，任何模式一致）", () => {
+  // 名单内 → 可用（归因用途；mode=all 下名单 = 已自助签发/管理员添加的成员）
+  assert.equal(
+    memberTokenAllowed({ visibility: { mode: "all", users: ["a@x.com"] } }, "a@x.com"),
+    true,
+  );
+  // 名单外 → 不可用
   assert.equal(memberTokenAllowed({ visibility: { mode: "all" } }, "a@x.com"), false);
+  assert.equal(memberTokenAllowed({}, "a@x.com"), false);
+  // 大小写归一化
+  assert.equal(
+    memberTokenAllowed({ visibility: { mode: "all", users: ["A@X.com"] } }, "a@x.com"),
+    true,
+  );
 });
 
 test("memberTokenAllowed：groups 命中不算（D2：groups 授权不参与成员 token，按组授权走包级）", () => {
