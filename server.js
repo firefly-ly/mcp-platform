@@ -113,57 +113,8 @@ try {
 } catch (_) {} // 建表/索引失败不阻断启动（与 audit 同策略）
 
 // 首次运行种子：已审批的 demo skill + demo mcp + 一些 demo 指标事件
-function seedIfEmpty() {
-  try {
-    const subCnt = db.prepare("SELECT COUNT(*) c FROM submissions").get().c;
-    if (subCnt > 0) return; // 已有人提交过，不再塞 demo
-    const now = Date.now();
-    const insSub = db.prepare("INSERT INTO submissions VALUES(?,?,?,?,?,?,?,?)");
-    const insMet = db.prepare("INSERT INTO metric_events VALUES(?,?,?,?,?,?)");
-
-    // demo 已审批 skill
-    const skills = [
-      { ref: "dws-explorer:1.0.0", name: "DWS 数据探查器", desc: "一键连接数仓、自动探查表结构与数据质量，生成可视化探查报告。", dl: 128 },
-      { ref: "meeting-minutes:0.2.1", name: "会议纪要生成器", desc: "上传会议录音或文字记录，自动提炼决议、待办与责任人，推送企微。", dl: 64 },
-      { ref: "code-reviewer:1.1.0", name: "代码审查助手", desc: "针对 PR/MR 做增量审查，给出风险点、合规项与修复建议。", dl: 211 },
-    ];
-    skills.forEach((d, i) => {
-      const id = "seed_skill_" + i;
-      insSub.run(
-        id, "admin", "skill", d.ref, "approved", "passed",
-        new Date(now - i * 86400000).toISOString(),
-        JSON.stringify({ name: d.name, description: d.desc, download_url: "", seed_downloads: d.dl, owner: "platform" }),
-      );
-      const k = Math.min(5, d.dl);
-      for (let j = 0; j < k; j++) {
-        insMet.run("ev_seed_" + i + "_" + j, "skill", id, "download", "demo", new Date(now - j * 3600000).toISOString());
-      }
-    });
-
-    // demo 已审批 mcp（用户提交的 MCP，审核通过后进入目录）
-    const mcps = [
-      { ref: "dingtalk-notify:0.3.0", name: "钉钉通知 MCP", desc: "把告警、审批、定时任务结果推送到钉钉群，支持富文本与@人。", owner: "alice" },
-      { ref: "sql-query:1.4.2", name: "SQL 查询 MCP", desc: "面向业务人员的自然语言转 SQL，只读模式连接内网数据库并可视化结果。", owner: "bob" },
-    ];
-    mcps.forEach((d, i) => {
-      const id = "seed_mcp_" + i;
-      insSub.run(
-        id, d.owner, "mcp", d.ref, "approved", "passed",
-        new Date(now - i * 86400000).toISOString(),
-        JSON.stringify({ name: d.name, description: d.desc, owner: d.owner }),
-      );
-      const k = i + 2; // 一些调用事件
-      for (let j = 0; j < k; j++) {
-        insMet.run("ev_mcp_seed_" + i + "_" + j, "mcp", id, "call", "demo", new Date(now - j * 3600000).toISOString());
-      }
-    });
-
-    log.info("已写入 demo skill / mcp 与指标种子数据");
-  } catch (e) {
-    log.warn("种子数据写入失败（可忽略，不影响运行）:", e.message);
-  }
-}
-seedIfEmpty();
+// （2026-10-14 自检整改外迁至 lib/seed.js）
+require("./lib/seed").seedIfEmpty(db, log);
 
 // 把 submissions 行映射为对外暴露的 MCP/Skill 视图对象
 function mapMcpRow(s, callMap, favMap) {
@@ -1204,41 +1155,10 @@ setInterval(() => { selfHealIngresses().catch(() => {}); }, 60 * 1000).unref();
 // ---- 数据库日常维护：每日备份 + 埋点表清理 ----
 // 备份：VACUUM INTO 生成一致性快照（在线安全，不动 WAL），保留最近 14 份。
 // SQLite 单文件无备份 = 磁盘损坏/误操作即全站数据丢失，这是上线底线配置。
-const BACKUP_DIR = path.join(__dirname, "backups");
-const BACKUP_KEEP = 14;
-function backupDatabase() {
-  try {
-    fs.mkdirSync(BACKUP_DIR, { recursive: true });
-    const stamp = new Date().toISOString().slice(0, 10);
-    const dest = path.join(BACKUP_DIR, `platform-${stamp}.db`);
-    if (fs.existsSync(dest)) return; // 同一天已有备份，不覆盖
-    db.prepare("VACUUM INTO ?").run(dest);
-    // 只保留最近 N 份
-    const files = fs.readdirSync(BACKUP_DIR)
-      .filter((f) => /^platform-\d{4}-\d{2}-\d{2}\.db$/.test(f))
-      .sort();
-    while (files.length > BACKUP_KEEP) {
-      try { fs.unlinkSync(path.join(BACKUP_DIR, files.shift())); } catch (_) { break; }
-    }
-    log.info("[维护] 数据库备份完成:", dest);
-  } catch (e) {
-    log.error("[维护] 数据库备份失败:", e.message);
-  }
-}
-// metric_events 是无限增长的埋点表（只有 INSERT 没有清理），且列表页/stats 会全表聚合——
-// 不清理必然拖慢查询。保留 90 天，ISO 字符串可直接字典序比较。
-function pruneMetricEvents() {
-  try {
-    const cutoff = new Date(Date.now() - 90 * 24 * 3600 * 1000).toISOString();
-    const info = db.prepare("DELETE FROM metric_events WHERE occurred_at < ?").run(cutoff);
-    if (info.changes > 0) log.info(`[维护] metric_events 清理 ${info.changes} 条（>90 天）`);
-  } catch (e) {
-    log.error("[维护] metric_events 清理失败:", e.message);
-  }
-}
-function runDailyMaintenance() { backupDatabase(); pruneMetricEvents(); }
-runDailyMaintenance(); // 启动时先跑一次（当天已有备份则跳过）
-setInterval(runDailyMaintenance, 24 * 3600 * 1000).unref();
+// （2026-10-14 自检整改外迁至 lib/maintenance.js）
+require("./lib/maintenance").scheduleDailyMaintenance(
+  db, log, path.join(__dirname, "backups"), 14,
+);
 
 // ---- 启动恢复：进程被杀可能留下永久卡死的 deploy_status='deploying'（部署轮询随进程一起死）----
 // 重启后按事实对齐：workload 真在跑 → 收敛为 deployed（含固定端口 ingress/endpoint 回写）；
