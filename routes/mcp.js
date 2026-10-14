@@ -555,6 +555,83 @@ module.exports = function registerMcpRoutes(app, ctx) {
     res.json({ ok: true, id: sub.id, member, token });
   });
 
+  // 批量签发 / 轮换（P1，2026-10-14，body: {members:[邮箱,...]}）：
+  // 逐个走与单签完全相同的校验（memberTokenAllowed）与入库逻辑，名单外成员跳过不中断整批。
+  // 用途：mode=all / groups 条目收编 restricted+users 后一次性为全员签发（收编动作见下方 merge-users）。
+  app.post("/submissions/:id/member-tokens/batch", (req, res) => {
+    const actor = actorFromReq(req);
+    if (!actor.admin) return res.status(403).json({ error: "仅管理员可批量签发成员 Token" });
+    const sub = db.prepare("SELECT * FROM submissions WHERE id=?").get(req.params.id);
+    if (!sub) return res.status(404).json({ error: "submission 不存在" });
+    if (sub.type !== "mcp") return res.status(400).json({ error: "只有 MCP 有代理 Token" });
+    const raw = Array.isArray(req.body && req.body.members) ? req.body.members : [];
+    // 归一化（与 visibility 名单同规则：小写去空白）+ 去重；上限 500 防误传全通讯录拖垮请求
+    const members = [...new Set(raw.map((m) => String(m || "").toLowerCase().trim()).filter(Boolean))];
+    if (!members.length) return res.status(400).json({ error: "缺少 members（成员邮箱数组）" });
+    if (members.length > 500) return res.status(400).json({ error: "单批最多 500 个成员" });
+    const meta = parseMeta(sub);
+    const now = new Date().toISOString();
+    const stmtSel = db.prepare("SELECT token FROM mcp_member_tokens WHERE submission_id=? AND member=?");
+    const stmtUpd = db.prepare("UPDATE mcp_member_tokens SET token=?, rotated_at=? WHERE submission_id=? AND member=?");
+    const stmtIns = db.prepare("INSERT INTO mcp_member_tokens VALUES(?,?,?,?,?)");
+    const results = members.map((member) => {
+      if (!memberTokenAllowed(meta, member)) {
+        return { member, ok: false, reason: "not_in_visibility" };
+      }
+      const existing = stmtSel.get(sub.id, member);
+      const token = crypto.randomBytes(16).toString("hex");
+      if (existing) {
+        stmtUpd.run(token, now, sub.id, member);
+        audit(req, "token_rotate", "mcp", sub.id, { scope: "member", member });
+        return { member, ok: true, action: "rotated", token };
+      }
+      stmtIns.run(sub.id, member, token, now, null);
+      audit(req, "token_issue", "mcp", sub.id, { scope: "member", member });
+      return { member, ok: true, action: "issued", token };
+    });
+    const okCount = results.filter((r) => r.ok).length;
+    audit(req, "token_batch", "mcp", sub.id, {
+      scope: "member-batch", total: members.length, issued_rotated: okCount,
+      skipped: members.length - okCount,
+    });
+    res.json({ ok: true, id: sub.id, total: members.length, issued: okCount, results });
+  });
+
+  // 可见范围名单合并（P1，IdP 无关）：把外部来源整理好的成员邮箱合并进 visibility.users。
+  // 用途：① mode=all 条目首次合并即自动转为 restricted（首次即完成「收编」）；
+  //       ② restricted+groups 条目把组展开后的邮箱并入 users（组员从此可签发成员 token）。
+  // 注意：不做 IdP 自动拉取——组成员数据在 Casdoor 且其即将退役，自动同步随 P2/Authentik
+  // 一并落地；本接口只接收已整理好的名单（企微通讯录导出 / 管理员手工整理均可）。
+  // drop_groups=true 时同时清空 groups（组授权改名单制的收尾动作，防止组员继续共用包级 token 的歧义）。
+  app.post("/submissions/:id/visibility/merge-users", (req, res) => {
+    const actor = actorFromReq(req);
+    if (!actor.admin) return res.status(403).json({ error: "仅管理员可合并可见范围名单" });
+    const sub = db.prepare("SELECT * FROM submissions WHERE id=?").get(req.params.id);
+    if (!sub) return res.status(404).json({ error: "submission 不存在" });
+    const raw = Array.isArray(req.body && req.body.users) ? req.body.users : [];
+    const incoming = [...new Set(raw.map((u) => String(u || "").toLowerCase().trim()).filter(Boolean))];
+    if (!incoming.length) return res.status(400).json({ error: "缺少 users（成员邮箱数组）" });
+    if (incoming.length > 5000) return res.status(400).json({ error: "单次最多合并 5000 个邮箱" });
+    const meta = parseMeta(sub);
+    const v = parseVisibility(meta);
+    const merged = [...new Set([...v.users, ...incoming])].sort();
+    const added = merged.filter((u) => !v.users.includes(u)).length;
+    const dropGroups = Boolean(req.body && req.body.drop_groups);
+    const nextGroups = dropGroups ? [] : v.groups;
+    patchMeta(sub.id, {
+      visibility: { mode: "restricted", users: merged, groups: nextGroups },
+      visibility_configured: true, // 管理员显式配置过可见范围 → 上架（isOnShelf 语义）
+    });
+    audit(req, "visibility_merge_users", sub.type, sub.id, {
+      before: { mode: v.mode, users: v.users.length, groups: v.groups },
+      added, total: merged.length, drop_groups: dropGroups,
+    });
+    res.json({
+      ok: true, id: sub.id, mode: "restricted",
+      added, total: merged.length, groups: nextGroups,
+    });
+  });
+
   // 吊销（成员 token 立即作废；该成员接入配置 401，需管理员重新签发）
   app.delete("/submissions/:id/member-tokens/:member", (req, res) => {
     const actor = actorFromReq(req);
