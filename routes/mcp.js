@@ -8,6 +8,7 @@ const crypto = require("node:crypto");
 const http = require("node:http");
 const express = require("express");
 const { parseVisibility, memberTokenAllowed } = require("../lib/visibility");
+const { normalizeEmail, normalizeEmails, readUsers, readRawVisibility, visibilityWithMember, issueOrRotateToken } = require("../lib/member-tokens");
 
 module.exports = function registerMcpRoutes(app, ctx) {
   const {
@@ -501,8 +502,7 @@ module.exports = function registerMcpRoutes(app, ctx) {
 
   // 列表：可见范围 users × 各自签发状态（token 一并返回，管理员可直接复制成员专属配置）。
   // 2026-10-14：任何模式都返回名单（mode=all 的名单 = 已自助签发/管理员添加的成员，
-  // 名单在切模式时保留）——读原始 meta.visibility.users，不能用 parseVisibility
-  // （其在 mode=all 时丢弃名单）。
+  // 名单在切模式时保留）。名单读取/归一化统一走 lib/member-tokens.js。
   app.get("/submissions/:id/member-tokens", (req, res) => {
     const actor = actorFromReq(req);
     if (!actor.admin) return res.status(403).json({ error: "仅管理员可查看成员 Token" });
@@ -510,22 +510,19 @@ module.exports = function registerMcpRoutes(app, ctx) {
     if (!sub) return res.status(404).json({ error: "submission 不存在" });
     if (sub.type !== "mcp") return res.status(400).json({ error: "只有 MCP 有代理 Token" });
     const meta = parseMeta(sub);
-    const rawVis = meta.visibility || {};
-    const users = (Array.isArray(rawVis.users) ? rawVis.users : [])
-      .map((u) => String(u).toLowerCase().trim())
-      .filter(Boolean);
+    const rv = readRawVisibility(meta);
     const rows = db
       .prepare("SELECT member, token, created_at, rotated_at FROM mcp_member_tokens WHERE submission_id=?")
       .all(sub.id);
     const byEmail = {};
     rows.forEach((r) => { byEmail[r.member] = r; });
-    const members = users.map((u) => ({
+    const members = readUsers(meta).map((u) => ({
       member: u,
       token: byEmail[u] ? byEmail[u].token : null,
       created_at: byEmail[u] ? byEmail[u].created_at : null,
       rotated_at: byEmail[u] ? byEmail[u].rotated_at : null,
     }));
-    res.json({ ok: true, mode: rawVis.mode === "restricted" ? "restricted" : "all", members });
+    res.json({ ok: true, mode: rv.mode, members });
   });
 
   // 签发 / 轮换（body: {member}）。已签发 → 轮换（旧 token 立即作废）；未签发 → 签发。
@@ -535,45 +532,23 @@ module.exports = function registerMcpRoutes(app, ctx) {
     const sub = db.prepare("SELECT * FROM submissions WHERE id=?").get(req.params.id);
     if (!sub) return res.status(404).json({ error: "submission 不存在" });
     if (sub.type !== "mcp") return res.status(400).json({ error: "只有 MCP 有代理 Token" });
-    const member = String((req.body && req.body.member) || "").toLowerCase().trim();
+    const member = normalizeEmail((req.body && req.body.member) || "");
     if (!member) return res.status(400).json({ error: "缺少 member（成员邮箱）" });
     // 管理员签发：名单内直接走 memberTokenAllowed；名单外（mode=all 下给新成员代签）
     // 自动把成员并入 users 再签发（audit 记 visibility_adopt_member）。
-    let meta = parseMeta(sub);
+    const meta = parseMeta(sub);
     if (!memberTokenAllowed(meta, member)) {
       if (!actor.admin) {
         return res.status(422).json({
           error: "该成员不在条目可见范围（按邮箱授权名单）内，请先在「可见范围」中添加",
         });
       }
-      const rawVis = meta.visibility || {};
-      const curUsers = (Array.isArray(rawVis.users) ? rawVis.users : [])
-        .map((u) => String(u).toLowerCase().trim()).filter(Boolean);
-      patchMeta(sub.id, {
-        visibility: {
-          mode: rawVis.mode === "restricted" ? "restricted" : "all",
-          users: [...new Set([...curUsers, member])].sort(),
-          groups: Array.isArray(rawVis.groups) ? rawVis.groups : [],
-        },
-        visibility_configured: true,
-      });
-      audit(req, "visibility_adopt_member", "mcp", sub.id, { member });
-      // 名单已落库；本路由后续只用 sub.id，无需重读 meta
+      const { visibility, changed } = visibilityWithMember(meta, member);
+      patchMeta(sub.id, { visibility, visibility_configured: true });
+      if (changed) audit(req, "visibility_adopt_member", "mcp", sub.id, { member });
     }
-    const now = new Date().toISOString();
-    const existing = db
-      .prepare("SELECT token FROM mcp_member_tokens WHERE submission_id=? AND member=?")
-      .get(sub.id, member);
-    const token = crypto.randomBytes(16).toString("hex");
-    if (existing) {
-      db.prepare("UPDATE mcp_member_tokens SET token=?, rotated_at=? WHERE submission_id=? AND member=?")
-        .run(token, now, sub.id, member);
-      audit(req, "token_rotate", "mcp", sub.id, { scope: "member", member });
-    } else {
-      db.prepare("INSERT INTO mcp_member_tokens VALUES(?,?,?,?,?)")
-        .run(sub.id, member, token, now, null);
-      audit(req, "token_issue", "mcp", sub.id, { scope: "member", member });
-    }
+    const { token, action } = issueOrRotateToken(db, sub.id, member, new Date().toISOString());
+    audit(req, action === "rotated" ? "token_rotate" : "token_issue", "mcp", sub.id, { scope: "member", member });
     res.json({ ok: true, id: sub.id, member, token });
   });
 
@@ -588,28 +563,18 @@ module.exports = function registerMcpRoutes(app, ctx) {
     if (sub.type !== "mcp") return res.status(400).json({ error: "只有 MCP 有代理 Token" });
     const raw = Array.isArray(req.body && req.body.members) ? req.body.members : [];
     // 归一化（与 visibility 名单同规则：小写去空白）+ 去重；上限 500 防误传全通讯录拖垮请求
-    const members = [...new Set(raw.map((m) => String(m || "").toLowerCase().trim()).filter(Boolean))];
+    const members = normalizeEmails(raw);
     if (!members.length) return res.status(400).json({ error: "缺少 members（成员邮箱数组）" });
     if (members.length > 500) return res.status(400).json({ error: "单批最多 500 个成员" });
     const meta = parseMeta(sub);
     const now = new Date().toISOString();
-    const stmtSel = db.prepare("SELECT token FROM mcp_member_tokens WHERE submission_id=? AND member=?");
-    const stmtUpd = db.prepare("UPDATE mcp_member_tokens SET token=?, rotated_at=? WHERE submission_id=? AND member=?");
-    const stmtIns = db.prepare("INSERT INTO mcp_member_tokens VALUES(?,?,?,?,?)");
     const results = members.map((member) => {
       if (!memberTokenAllowed(meta, member)) {
         return { member, ok: false, reason: "not_in_visibility" };
       }
-      const existing = stmtSel.get(sub.id, member);
-      const token = crypto.randomBytes(16).toString("hex");
-      if (existing) {
-        stmtUpd.run(token, now, sub.id, member);
-        audit(req, "token_rotate", "mcp", sub.id, { scope: "member", member });
-        return { member, ok: true, action: "rotated", token };
-      }
-      stmtIns.run(sub.id, member, token, now, null);
-      audit(req, "token_issue", "mcp", sub.id, { scope: "member", member });
-      return { member, ok: true, action: "issued", token };
+      const { token, action } = issueOrRotateToken(db, sub.id, member, now);
+      audit(req, action === "rotated" ? "token_rotate" : "token_issue", "mcp", sub.id, { scope: "member", member });
+      return { member, ok: true, action, token };
     });
     const okCount = results.filter((r) => r.ok).length;
     audit(req, "token_batch", "mcp", sub.id, {
@@ -631,21 +596,23 @@ module.exports = function registerMcpRoutes(app, ctx) {
     const sub = db.prepare("SELECT * FROM submissions WHERE id=?").get(req.params.id);
     if (!sub) return res.status(404).json({ error: "submission 不存在" });
     const raw = Array.isArray(req.body && req.body.users) ? req.body.users : [];
-    const incoming = [...new Set(raw.map((u) => String(u || "").toLowerCase().trim()).filter(Boolean))];
+    const incoming = normalizeEmails(raw);
     if (!incoming.length) return res.status(400).json({ error: "缺少 users（成员邮箱数组）" });
     if (incoming.length > 5000) return res.status(400).json({ error: "单次最多合并 5000 个邮箱" });
     const meta = parseMeta(sub);
-    const v = parseVisibility(meta);
-    const merged = [...new Set([...v.users, ...incoming])].sort();
-    const added = merged.filter((u) => !v.users.includes(u)).length;
+    // 基线名单读原始 visibility（readRawVisibility）——parseVisibility 在 mode=all 时
+    // 返回空名单，用它做基线会把保留的名单清掉（2026-10-14 自检整改时修复的潜伏 bug）。
+    const rv = readRawVisibility(meta);
+    const merged = [...new Set([...rv.users, ...incoming])].sort();
+    const added = merged.filter((u) => !rv.users.includes(u)).length;
     const dropGroups = Boolean(req.body && req.body.drop_groups);
-    const nextGroups = dropGroups ? [] : v.groups;
+    const nextGroups = dropGroups ? [] : rv.groups;
     patchMeta(sub.id, {
       visibility: { mode: "restricted", users: merged, groups: nextGroups },
       visibility_configured: true, // 管理员显式配置过可见范围 → 上架（isOnShelf 语义）
     });
     audit(req, "visibility_merge_users", sub.type, sub.id, {
-      before: { mode: v.mode, users: v.users.length, groups: v.groups },
+      before: { mode: rv.mode, users: rv.users.length, groups: rv.groups },
       added, total: merged.length, drop_groups: dropGroups,
     });
     res.json({
@@ -674,35 +641,14 @@ module.exports = function registerMcpRoutes(app, ctx) {
       return res.status(403).json({ error: "你不在该条目的可见范围内，无法自助签发" });
     }
     const now = new Date().toISOString();
-    const existing = db
-      .prepare("SELECT token FROM mcp_member_tokens WHERE submission_id=? AND member=?")
-      .get(sub.id, member);
-    const token = crypto.randomBytes(16).toString("hex");
-    if (existing) {
-      db.prepare("UPDATE mcp_member_tokens SET token=?, rotated_at=? WHERE submission_id=? AND member=?")
-        .run(token, now, sub.id, member);
-      audit(req, "token_rotate", "mcp", sub.id, { scope: "member", member, self_service: true });
-    } else {
-      db.prepare("INSERT INTO mcp_member_tokens VALUES(?,?,?,?,?)")
-        .run(sub.id, member, token, now, null);
-      audit(req, "token_issue", "mcp", sub.id, { scope: "member", member, self_service: true });
-    }
+    const { token, action } = issueOrRotateToken(db, sub.id, member, now);
+    audit(req, action === "rotated" ? "token_rotate" : "token_issue", "mcp", sub.id, { scope: "member", member, self_service: true });
     // 名单自增长：把签发者并入 users（幂等；mode=all 下名单保留，切回受限即生效）。
-    // 注意读原始 meta.visibility 而非 parseVisibility()——后者在 mode=all 时丢弃
-    // users/groups（判定语义），用它做合并基准会把 groups 清空、名单重复并入。
-    const rawVis = meta.visibility || {};
-    const curUsers = (Array.isArray(rawVis.users) ? rawVis.users : [])
-      .map((s) => String(s).toLowerCase().trim()).filter(Boolean);
+    // 合并基准统一走 lib/member-tokens.js（读原始 meta.visibility，勿用 parseVisibility）。
+    const { visibility, changed } = visibilityWithMember(meta, member);
     let adopted = false;
-    if (!curUsers.includes(member)) {
-      patchMeta(sub.id, {
-        visibility: {
-          mode: rawVis.mode === "restricted" ? "restricted" : "all",
-          users: [...curUsers, member].sort(),
-          groups: Array.isArray(rawVis.groups) ? rawVis.groups : [],
-        },
-        visibility_configured: true,
-      });
+    if (changed) {
+      patchMeta(sub.id, { visibility, visibility_configured: true });
       audit(req, "visibility_adopt_member", "mcp", sub.id, { member });
       adopted = true;
     }
