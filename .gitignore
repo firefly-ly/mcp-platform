@@ -42,3 +42,4 @@ Thumbs.db
 .workbuddy/
 _tmp_*
 *.corrupt/
+eslint-report.json
