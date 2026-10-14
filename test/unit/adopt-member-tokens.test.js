@@ -9,7 +9,7 @@ const os = require("node:os");
 const path = require("node:path");
 const Database = require("better-sqlite3");
 
-const { parseArgs, pickTargets, main } = require("../../scripts/adopt-member-tokens");
+const { pickTargets, main } = require("../../scripts/adopt-member-tokens");
 
 function makeDbFile() {
   const dbPath = path.join(os.tmpdir(), "adopt-test-" + Date.now() + "-" + process.pid + ".db");

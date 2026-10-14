@@ -5,7 +5,7 @@ const assert = require("node:assert/strict");
 const Database = require("better-sqlite3");
 
 const {
-  normalizeEmail, normalizeEmails, readUsers, readRawVisibility,
+  normalizeEmails, readUsers, readRawVisibility,
   visibilityWithMember, issueOrRotateToken,
 } = require("../../lib/member-tokens");
 

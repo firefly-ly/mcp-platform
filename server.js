@@ -17,10 +17,9 @@ const crypto = require("crypto");
 const os = require("os");
 const { execFileHidden, safeExec } = require("./lib/exec");
 const http = require("http");
-const zlib = require("zlib");
 const objStore = require("./object-store");
 const log = require("./lib/logger"); // 统一日志：时间戳 + 级别（lib/logger.js）
-const { parseVisibility, isOnShelf, canAccessSubmission } = require("./lib/visibility");
+const { isOnShelf, canAccessSubmission } = require("./lib/visibility");
 
 // 内置 .env 加载（不依赖 dotenv）：仅填充未设置的环境变量，已导出的优先
 (() => {
@@ -399,7 +398,6 @@ Object.assign(CTX, {
 const { audit, deniedThrottled } = require("./lib/audit")(CTX);
 CTX.audit = audit;
 const {
-  parseDotenv, scanSourceEnvKeys, thvSecretSet, thvSecretDelete, secretNameFor,
   storeSubmissionEnv, deleteSubmissionSecrets, envInjectArgs, authHeaderCandidates,
 } = require("./lib/env-secrets")(CTX);
 // MCP 协议客户端（2026-09-18 拆分第五步）：纯 fetch 无状态，仅需 authHeaderCandidates。
@@ -428,9 +426,9 @@ const { resolveMcpProxyTarget, mcpProxyHandler } = require("./lib/mcp-proxy")({
   http, db, parseMeta, workloadNameFor, authHeaderCandidates, deniedThrottled, audit,
   getIngressPort, ensureStableIngress, discoverThvEndpoint, subIdByWorkload, healMcpIngress,
 });
-const { buildSourceImage, SOURCE_MAX_MB } = require("./lib/source-build")(CTX);
+const { buildSourceImage } = require("./lib/source-build")(CTX);
 const {
-  trivyUsable, runTrivyScan, runPromptScan, runSubmissionScans, PROMPT_INJECTION_RULES,
+  runTrivyScan, runSubmissionScans, PROMPT_INJECTION_RULES,
 } = require("./lib/scan")(CTX);
 const { healFailState, HEAL_BACKOFF_MS, reconcileMcpWorkloads } = require("./lib/reconcile")(CTX);
 

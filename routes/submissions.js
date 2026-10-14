@@ -19,7 +19,7 @@ module.exports = function registerSubmissionsRoutes(app, ctx) {
     ensureGroupMeta, ensureRegistryMeta, registryDelete, registryPublish,
     listGroupVersions, classifyRegistry, runSubmissionScans,
     deleteSubmissionSecrets, undeployMcp, deployMcp,
-    canAccessSubmission, pickDisplayVersions, isOnShelf,
+    isOnShelf,
     validateSkillPackage, inspectSkillPackage,
     INTERNAL_REGISTRY, INTERNAL_ONLY, TRUSTED_REGISTRIES,
     RATE_WINDOW_MS, RATE_MAX, DUP_STATUSES, MAX_BUFFER,
@@ -98,7 +98,6 @@ module.exports = function registerSubmissionsRoutes(app, ctx) {
       m.name = validation.name;
       m.description = validation.description;
     }
-    const nm = normName(m.name);
     const existing = db.prepare(
       "SELECT id, status, meta, payload_ref FROM submissions WHERE user_id=? AND type=? AND status IN (" +
       DUP_STATUSES.map(() => "?").join(",") + ")"
@@ -263,7 +262,7 @@ module.exports = function registerSubmissionsRoutes(app, ctx) {
       prompt_scan_status: meta.prompt_scan ? meta.prompt_scan.status : "none",
     });
     // 同步到 Registry Server：先落注册名/版本，便于后续下线/删除时定位条目
-    const gv = ensureGroupMeta(sub);
+    ensureGroupMeta(sub);
     ensureRegistryMeta(sub);
     // 2026-09-08：active_versions 指针已废弃——用户侧版本下拉可自选已上架版本，
     // 目录默认展示"最新已上架版本"（见 pickDisplayVersions），不再维护激活指针。

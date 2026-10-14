@@ -11,7 +11,7 @@ const createWindowRateLimiter = require("../lib/rate-limit");
 
 module.exports = function registerSubmissionUploadRoutes(app, ctx) {
   const {
-    db, parseMeta, actorFromReq, audit, deniedThrottled,
+    db, actorFromReq, audit, deniedThrottled,
     objStore, stagingKey, sanitizeUploadName, ensureGroupMeta, runSubmissionScans,
     INTERNAL_PROXY_TOKEN, RATE_WINDOW_MS,
     tarListFile, MAX_TAR_UPLOAD_MB, MAX_TAR_UPLOAD_BYTES,

@@ -327,9 +327,9 @@ module.exports = function createDeployService(ctx) {
         if (names.length) {
           await execFileHidden("docker", ["stop", ...names], { timeout: 60000, maxBuffer: MAX_BUFFER });
         }
-      } catch (_) {}
+      } catch (_) { /* 停运行容器失败不阻断下线：状态仍会写回 undeployed，可用重新部署恢复 */ }
       // 平台自建的固定端口 socat ingress 不归 thv 管，同步停掉（重上线时 ensureStableIngress 会重建）
-      try { await execFileHidden("docker", ["stop", `${workload}-ingress`], { timeout: 15000, maxBuffer: MAX_BUFFER }); } catch (_) {}
+      try { await execFileHidden("docker", ["stop", `${workload}-ingress`], { timeout: 15000, maxBuffer: MAX_BUFFER }); } catch (_) { /* ingress 不存在或已停，忽略 */ }
     }
     patchMeta(id, { deploy_status: "undeployed", endpoint: "", deploy_error: "" });
     // 注：下线只停容器 + 清运行态，Registry 目录条目保留（按设计：仅「删除」才从 Registry 摘除）。

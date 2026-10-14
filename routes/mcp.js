@@ -5,19 +5,16 @@
 //   前者对中间件链顺序敏感（必须在 express.json 之前），后者是安全边界，二者不宜随本模块迁移。
 // 依赖经 ctx 注入（全部为 server.js 中的声明式函数或先于此装配的常量）：
 const crypto = require("node:crypto");
-const http = require("node:http");
-const express = require("express");
-const { parseVisibility, memberTokenAllowed } = require("../lib/visibility");
+const { memberTokenAllowed } = require("../lib/visibility");
 const { normalizeEmail, normalizeEmails, readUsers, readRawVisibility, visibilityWithMember, issueOrRotateToken } = require("../lib/member-tokens");
 
 module.exports = function registerMcpRoutes(app, ctx) {
   const {
-    db, parseMeta, patchMeta, actorFromReq, audit, deniedThrottled,
+    db, parseMeta, patchMeta, actorFromReq, audit,
     canAccessSubmission, pickDisplayVersions, isOnShelf, LIVE_MCPS,
     discoverIngressForSubmission, probeMcpEndpoint, discoverThvEndpoint,
-    resolveMcpProxyTarget, subIdByWorkload, healMcpIngress,
-    mapMcpRow, publicEndpointFor, mcpAuthHeadersFor, getOrCreateMcpToken,
-    authHeaderCandidates, mcpCallAuthed, rewriteForWsl2, resolveEndpoint,
+    mapMcpRow, publicEndpointFor, mcpAuthHeadersFor,
+    mcpCallAuthed, rewriteForWsl2, resolveEndpoint,
     workloadNameFor, servePackageFile, execFileHidden, MAX_BUFFER,
     inspectSkillPackage, MCP_TREE_MAX,
   } = ctx;
