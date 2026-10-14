@@ -7,6 +7,7 @@
 "use strict";
 const path = require("node:path");
 const logger = require("../lib/logger");
+const { resolveVisibilitySave } = require("../lib/visibility");
 
 // README/文件树提取规则版本号（与 routes/mcp.js 各自独立持有一份，语义一致）
 const MCP_README_INSPECT_VERSION = 3;
@@ -168,34 +169,40 @@ module.exports = function registerSubmissionsRoutes(app, ctx) {
     res.json(visible);
   });
 
-  // 管理员设置条目可见范围（发布时决定哪些成员/组可查看/下载/调用）
+  // 管理员设置条目可见范围（发布时决定哪些成员/组可查看/下载/调用）。
+  // 2026-10-14 起名单与模式解耦（resolveVisibilitySave）：mode=all 的保存不动名单，
+  // restricted 缺省保留现值、显式提供才覆盖，空名单 + 已有成员 token 自动并入成员邮箱——
+  // 防止 UI 弹窗保存把收编（merge-users）写入的名单覆盖丢失。
   app.post("/submissions/:id/visibility", (req, res) => {
     const actor = actorFromReq(req);
     if (!actor.admin)
       return res.status(403).json({ error: "仅管理员可设置可见范围" });
     const sub = db.prepare("SELECT * FROM submissions WHERE id=?").get(req.params.id);
     if (!sub) return res.status(404).json({ error: "submission 不存在" });
-    const { mode, users, groups } = req.body || {};
+    const { mode } = req.body || {};
     if (mode !== "all" && mode !== "restricted")
       return res.status(400).json({ error: "mode 必须是 all 或 restricted" });
-    const visibility = {
-      mode,
-      users: Array.isArray(users)
-        ? users.map((s) => String(s).trim()).filter(Boolean)
-        : [],
-      groups: Array.isArray(groups)
-        ? groups.map((s) => String(s).trim()).filter(Boolean)
-        : [],
-    };
-    // 管理员显式保存可见范围 = 完成「上线」配置；此后该条目才对所选范围开放可见/下载/调用
     const prevVis = parseMeta(sub).visibility || null;
+    const memberEmails =
+      sub.type === "mcp"
+        ? db
+            .prepare("SELECT DISTINCT member FROM mcp_member_tokens WHERE submission_id=?")
+            .all(sub.id)
+            .map((r) => r.member)
+        : [];
+    const { visibility, adoptMembers } = resolveVisibilitySave(prevVis, req.body || {}, memberEmails);
+    // 管理员显式保存可见范围 = 完成「上线」配置；此后该条目才对所选范围开放可见/下载/调用
     patchMeta(sub.id, { visibility, visibility_configured: true });
     // Skill 上架：此前未发布到 Registry（approve 时延后），此刻才发布，使其对目录/用户可发现
     if (sub.type === "skill") {
       registryPublish(sub.id).catch((e) => logger.error("同步 Registry 失败(上架):", sub.id, e && e.message));
     }
-    audit(req, "visibility_change", sub.type, sub.id, { from: prevVis, to: visibility });
-    res.json({ id: sub.id, visibility, visibility_configured: true });
+    audit(req, "visibility_change", sub.type, sub.id, {
+      from: prevVis, to: visibility,
+      adopt_members: adoptMembers || undefined,
+      payload_users_ignored: mode === "all" && Array.isArray((req.body || {}).users) ? true : undefined,
+    });
+    res.json({ id: sub.id, visibility, visibility_configured: true, adopt_members: adoptMembers });
   });
 
   // 镜像来源分级查询：供提交表单做实时提示。

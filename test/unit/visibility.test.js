@@ -4,7 +4,7 @@
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const {
-  parseVisibility, isOnShelf, canAccessSubmission, memberTokenAllowed,
+  parseVisibility, isOnShelf, canAccessSubmission, memberTokenAllowed, resolveVisibilitySave,
 } = require("../../lib/visibility");
 
 const user = (email, groups = [], admin = false) => ({ email, groups, admin });
@@ -91,4 +91,43 @@ test("memberTokenAllowed：member 大小写/空白归一化，空值拒绝", () 
   assert.equal(memberTokenAllowed(meta, ""), false);
   assert.equal(memberTokenAllowed(meta, null), false);
   assert.equal(memberTokenAllowed(meta, undefined), false);
+});
+
+// ---- resolveVisibilitySave（2026-10-14：名单与模式解耦，防 UI 保存覆盖收编名单）----
+
+test("resolveVisibilitySave：mode=all 保存忽略 payload 名单，保留现值", () => {
+  const prev = { mode: "restricted", users: ["a@x.com", "b@x.com"], groups: ["dev"] };
+  const r = resolveVisibilitySave(prev, { mode: "all", users: [], groups: [] }, []);
+  assert.deepEqual(r.visibility, { mode: "all", users: ["a@x.com", "b@x.com"], groups: ["dev"] });
+  assert.equal(r.adoptMembers, false);
+});
+
+test("resolveVisibilitySave：restricted 显式名单覆盖；缺省保留现值", () => {
+  const prev = { mode: "restricted", users: ["a@x.com"], groups: ["dev"] };
+  const r1 = resolveVisibilitySave(prev, { mode: "restricted", users: ["c@x.com"] }, []);
+  assert.deepEqual(r1.visibility.users, ["c@x.com"]);
+  assert.deepEqual(r1.visibility.groups, ["dev"]); // groups 缺省保留
+  const r2 = resolveVisibilitySave(prev, { mode: "restricted" }, []);
+  assert.deepEqual(r2.visibility, { mode: "restricted", users: ["a@x.com"], groups: ["dev"] });
+});
+
+test("resolveVisibilitySave：restricted 空名单 + 已有成员 token → 自动并入成员邮箱", () => {
+  const prev = { mode: "restricted", users: ["a@x.com"], groups: [] };
+  const r = resolveVisibilitySave(prev, { mode: "restricted", users: [] }, ["Zhang@X.com ", "b@x.com"]);
+  assert.deepEqual(r.visibility.users, ["zhang@x.com", "b@x.com"]);
+  assert.equal(r.adoptMembers, true);
+});
+
+test("resolveVisibilitySave：restricted 空名单且无成员 token → 允许真清空", () => {
+  const prev = { mode: "restricted", users: ["a@x.com"], groups: [] };
+  const r = resolveVisibilitySave(prev, { mode: "restricted", users: [], groups: [] }, []);
+  assert.deepEqual(r.visibility.users, []);
+  assert.equal(r.adoptMembers, false);
+});
+
+test("resolveVisibilitySave：prev 为 null（未配置过）按空名单起算", () => {
+  const r = resolveVisibilitySave(null, { mode: "restricted", users: ["a@x.com"] }, []);
+  assert.deepEqual(r.visibility, { mode: "restricted", users: ["a@x.com"], groups: [] });
+  const r2 = resolveVisibilitySave(null, { mode: "all" }, ["m@x.com"]);
+  assert.deepEqual(r2.visibility, { mode: "all", users: [], groups: [] });
 });
