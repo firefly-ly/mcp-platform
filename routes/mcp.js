@@ -21,21 +21,21 @@ module.exports = function registerMcpRoutes(app, ctx) {
     inspectSkillPackage, MCP_TREE_MAX,
   } = ctx;
 
-  // ---- 成员级代理 Token（双轨制 2026-10-13）----
-  // 按调用者身份出代理凭证（D1 成员视角）：
-  //  - admin / LIVE_MCPS（无 submission）/ mode=all 条目 → 包级 token（现状不变；
-  //    mode=all 发包级是既有语义：4100 对外口强制 token，且管理员后续切 restricted 时存量配置仍有效）；
-  //  - restricted 条目非管理员 → 只发自己的成员 token（未签发则不出 headers，置 mcp_token_required=true，
-  //    前端复制配置弹窗提示「联系管理员签发」）——包级 token 不再下发给普通成员（D1=A：防踢人后被包级配置绕过）。
+  // ---- 成员级代理 Token（双轨制 2026-10-13；D1 修订 2026-10-14：凭证与可见性模式解耦）----
+  // 按调用者身份出代理凭证（D1 修订后语义）：
+  //  - admin → 包级 token（应急/管理员专用，不再作为普通成员凭证下发）；
+  //  - 普通成员 → 一律个人成员 token（任何可见性模式，含 mode=all / groups），
+  //    未签发则不出 headers、置 mcp_token_required=true，前端引导走自助签发
+  //    （POST /submissions/:id/my-member-token，资格在签发时按 actor 身份+groups 判定）。
+  //  修订理由：包级共享凭证无法按人轮换/审计（caller=package），是 agent 管控的盲区。
   // 返回 { headers, tokenRequired }：headers 供 mcp_headers 字段，tokenRequired 供前端区分「无凭证」与「未签发」。
   function mcpHeadersForActor(s, actor) {
     const meta = parseMeta(s);
     const workload = meta.workload_name || workloadNameFor(s.id);
-    const headers = mcpAuthHeadersFor(workload); // 副作用：确保包级 token 存在（管理员/存量路径依赖）
-    if (!headers) return { headers: undefined, tokenRequired: false };
-    if (actor.admin) return { headers, tokenRequired: false };
-    const vis = parseVisibility(meta);
-    if (vis.mode !== "restricted") return { headers, tokenRequired: false };
+    if (actor.admin) {
+      const headers = mcpAuthHeadersFor(workload); // 副作用：确保包级 token 存在（管理员/应急路径依赖）
+      return { headers, tokenRequired: false };
+    }
     const member = String(actor.email || "").toLowerCase().trim();
     const mt = member
       ? db.prepare("SELECT token FROM mcp_member_tokens WHERE submission_id=? AND member=?").get(s.id, member)
@@ -629,6 +629,68 @@ module.exports = function registerMcpRoutes(app, ctx) {
     res.json({
       ok: true, id: sub.id, mode: "restricted",
       added, total: merged.length, groups: nextGroups,
+    });
+  });
+
+  // 自助签发（2026-10-14，D2 修订：groups 在「签发时」参与资格判定，调用层仍凭个人 token）。
+  // 登录用户为自己签发/轮换成员 token，资格走 canAccessSubmission 单一入口：
+  //   mode=all → 任何登录用户；restricted+users → 名单内；restricted+groups → 组命中；
+  //   未上架（visibility_configured=false）仅管理员可见，普通用户天然 403。
+  // 签发即把成员并入 visibility.users（名单自增长，audit 留痕）——proxy 双轨校验零改动，
+  // memberTokenAllowed（member ∈ users）天然放行；组资格只在签发时验证一次，
+  // 调岗后 token 仍有效的问题由 P2（IDM 同步 / token 有效期）兜底。
+  app.post("/submissions/:id/my-member-token", (req, res) => {
+    const actor = actorFromReq(req);
+    const member = String(actor.email || "").toLowerCase().trim();
+    if (!member) return res.status(401).json({ error: "未识别到登录身份" });
+    const sub = db.prepare("SELECT * FROM submissions WHERE id=?").get(req.params.id);
+    if (!sub) return res.status(404).json({ error: "submission 不存在" });
+    if (sub.type !== "mcp") return res.status(400).json({ error: "只有 MCP 有代理 Token" });
+    const meta = parseMeta(sub);
+    if (!actor.admin && !canAccessSubmission(meta, actor)) {
+      audit(req, "token_selfissue_denied", "mcp", sub.id, { member }, "denied");
+      return res.status(403).json({ error: "你不在该条目的可见范围内，无法自助签发" });
+    }
+    const now = new Date().toISOString();
+    const existing = db
+      .prepare("SELECT token FROM mcp_member_tokens WHERE submission_id=? AND member=?")
+      .get(sub.id, member);
+    const token = crypto.randomBytes(16).toString("hex");
+    if (existing) {
+      db.prepare("UPDATE mcp_member_tokens SET token=?, rotated_at=? WHERE submission_id=? AND member=?")
+        .run(token, now, sub.id, member);
+      audit(req, "token_rotate", "mcp", sub.id, { scope: "member", member, self_service: true });
+    } else {
+      db.prepare("INSERT INTO mcp_member_tokens VALUES(?,?,?,?,?)")
+        .run(sub.id, member, token, now, null);
+      audit(req, "token_issue", "mcp", sub.id, { scope: "member", member, self_service: true });
+    }
+    // 名单自增长：把签发者并入 users（幂等；mode=all 下名单保留，切回受限即生效）。
+    // 注意读原始 meta.visibility 而非 parseVisibility()——后者在 mode=all 时丢弃
+    // users/groups（判定语义），用它做合并基准会把 groups 清空、名单重复并入。
+    const rawVis = meta.visibility || {};
+    const curUsers = (Array.isArray(rawVis.users) ? rawVis.users : [])
+      .map((s) => String(s).toLowerCase().trim()).filter(Boolean);
+    let adopted = false;
+    if (!curUsers.includes(member)) {
+      patchMeta(sub.id, {
+        visibility: {
+          mode: rawVis.mode === "restricted" ? "restricted" : "all",
+          users: [...curUsers, member].sort(),
+          groups: Array.isArray(rawVis.groups) ? rawVis.groups : [],
+        },
+        visibility_configured: true,
+      });
+      audit(req, "visibility_adopt_member", "mcp", sub.id, { member });
+      adopted = true;
+    }
+    // 顺带返回接入配置（等价 member-token-config，省一次往返）
+    const fresh = parseMeta(db.prepare("SELECT * FROM submissions WHERE id=?").get(sub.id));
+    const endpoint = fresh.endpoint || null;
+    res.json({
+      ok: true, id: sub.id, member, token, adopted,
+      url: endpoint ? publicEndpointFor(fresh.workload_name || workloadNameFor(sub.id), endpoint, req) : null,
+      headers: { Authorization: `Bearer ${token}` },
     });
   });
 
