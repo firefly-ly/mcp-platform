@@ -15,6 +15,14 @@
  * @property {(imageRef: string) => Promise<Object|null>} extractMcpInspect  镜像元数据提取（脱敏）
  * @property {Function} runTrivyScan  源码构建部署后的补扫
  * @property {Function} invalidateMcpRuntimeCaches  部署事件双清 rtCache/toolsCache
+ * @property {number} MAX_BUFFER execFile maxBuffer
+ * @property {string} THV_BIN toolhive CLI 路径
+ * @property {string} DOCKER_BIN docker CLI 路径
+ * @property {(id: string) => string} workloadNameFor  submission id → workload 名
+ * @property {Function} registryPublish  发布/同步 Registry
+ * @property {Function} ensureStableIngress  幂等确保固定端口 socat ingress
+ * @property {Function} probeMcpEndpoint  MCP 端点探活
+ * @property {string} TAR_ROOT  tar 制品根目录
  */
 const fs = require("node:fs");
 const path = require("node:path");
@@ -76,7 +84,7 @@ module.exports = function createDeployService(ctx) {
   const deployLocks = new Set();
   async function withDeployLock(id, fn) {
     if (deployLocks.has(id)) {
-      const err = new Error("该 MCP 正在部署/下线中，请等待当前操作完成后再试");
+      const err = /** @type {Error & { code?: string }} */ (new Error("该 MCP 正在部署/下线中，请等待当前操作完成后再试"));
       err.code = "DEPLOY_BUSY";
       throw err;
     }
@@ -90,7 +98,7 @@ module.exports = function createDeployService(ctx) {
 
   async function deployMcpInner(id) {
     invalidateMcpRuntimeCaches(id); // 部署双清 tools/rt 两层缓存（routes/mcp 注入）
-    const sub = db.prepare("SELECT * FROM submissions WHERE id=?").get(id);
+    const sub = /** @type {import("../lib/types").SubmissionRow | undefined} */ (db.prepare("SELECT * FROM submissions WHERE id=?").get(id));
     if (!sub || sub.type !== "mcp") return;
     const meta = parseMeta(sub);
     // 网络隔离豁免（按条目）：.env THV_ISOLATE_NETWORK_OFF 命中本条目时退出 thv 隔离网络。
@@ -224,7 +232,7 @@ module.exports = function createDeployService(ctx) {
       // 原地恢复就绪轮询：docker start 不会复活 thv 的宿主代理进程，thv 报告的 url 已死，
       // 故不走下方 thv-url 轮询，改走平台自己的固定端口 ingress 链路：
       // 主容器就绪 → ensureStableIngress 重建 socat（若主容器 IP 变了也能纠正）→ 探活。
-      let fastEndpoint = null;
+      /** @type {string | null} */ let fastEndpoint = null;
       for (let i = 0; i < 60; i++) { // 上限 ~3 分钟，实测秒级
         await sleep(3000);
         try {
@@ -304,7 +312,7 @@ module.exports = function createDeployService(ctx) {
   /** @param {string} id 幂等：条目不存在/非 MCP/sidecar 已清均静默返回 */
   async function undeployMcpInner(id, opts = {}) {
     invalidateMcpRuntimeCaches(id); // 停止/部署双清 tools/rt 两层缓存（routes/mcp 注入）
-    const sub = db.prepare("SELECT * FROM submissions WHERE id=?").get(id);
+    const sub = /** @type {import("../lib/types").SubmissionRow | undefined} */ (db.prepare("SELECT * FROM submissions WHERE id=?").get(id));
     if (!sub || sub.type !== "mcp") return;
     const meta = parseMeta(sub);
     const workload = meta.workload_name || workloadNameFor(id);

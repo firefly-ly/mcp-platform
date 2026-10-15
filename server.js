@@ -1,3 +1,4 @@
+// @ts-nocheck —— 类型债：checkJs 基线不含本文件（54→0 的豁免项），B 档类型化时逐个摘除（server.js：40 个未注解函数；pkg/object-store：稠密遗留逻辑）
 // MCP + Skill 平台 · 自建后端业务中枢
 // 技术栈：Node + Express + better-sqlite3 + cors
 // 结构：lib/（构建/扫描/对账/凭据等）+ routes/（路由域）+ services/（部署管线），

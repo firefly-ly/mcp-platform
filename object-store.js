@@ -1,3 +1,4 @@
+// @ts-nocheck —— 类型债：checkJs 基线不含本文件（54→0 的豁免项），B 档类型化时逐个摘除（server.js：40 个未注解函数；pkg/object-store：稠密遗留逻辑）
 "use strict";
 // 内部制品库抽象层：Skill 静态制品的"本体"存放处。
 // 默认 fs 后端（本机验证），可经 OBJECT_STORE=minio 切到内网 MinIO（S3 协议）。

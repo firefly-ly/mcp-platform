@@ -189,6 +189,7 @@ module.exports = function registerSubmissionUploadRoutes(app, ctx) {
       try {
         dataSource = req.query.data_source ? JSON.parse(String(req.query.data_source)) : undefined;
       } catch (_) { dataSource = undefined; }
+      /** @type {import("../lib/types").SubmissionMeta & Record<string, unknown>} */
       const meta = {
         name,
         ...(version ? { version } : {}),
