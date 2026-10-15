@@ -181,70 +181,14 @@ const THV_BIN = process.env.THV_BIN ||
     : "thv");
 
 // ---- 内网镜像仓库（MCP 镜像内网化）配置 ----
-// INTERNAL_REGISTRY：内网 OCI registry 地址。本地自测用 localhost:5000，
-// 生产换成内网 Harbor 地址即可，代码无需改动（同为标准 OCI 接口）。
-const INTERNAL_REGISTRY = (process.env.INTERNAL_REGISTRY || "localhost:5000").replace(/\/+$/, "");
-// TRUSTED_REGISTRIES：受信外部镜像源白名单（逗号分隔）。命中的允许提交，标注来源并留痕。
-const TRUSTED_REGISTRIES = (process.env.TRUSTED_REGISTRIES || "ghcr.io/stackloklabs,ghcr.io/stacklok")
-  .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
-// INTERNAL_ONLY：严格模式，置 1 时只接受内网 registry 的镜像（档2 一并拒绝）
-const INTERNAL_ONLY = process.env.INTERNAL_ONLY === "1" || process.env.INTERNAL_ONLY === "true";
+// （2026-10-15 自检整改：配置与分级信任模型外迁 lib/classify-registry.js）
+const { classifyRegistry, INTERNAL_REGISTRY, INTERNAL_ONLY, TRUSTED_REGISTRIES } =
+  require("./lib/classify-registry");
 const DOCKER_BIN = process.env.DOCKER_BIN || "docker";
 // MCP 镜像 tar 包上传上限（默认 2GB）。超出提示用户改用 ghcr 地址提交。
 // 设计原则：tar 经审批后直接 docker load 进本地 daemon 运行，不强制推回内网 registry。
 const MAX_TAR_UPLOAD_MB = Number(process.env.MAX_TAR_UPLOAD_MB || 2048);
 const MAX_TAR_UPLOAD_BYTES = MAX_TAR_UPLOAD_MB * 1024 * 1024;
-
-// 提取镜像引用的 registry 部分：无域名前缀（如 node:22）视为 docker.io
-function registryOf(ref) {
-  const s = String(ref || "").trim();
-  const first = s.split("/")[0];
-  if (first.includes(".") || first.includes(":") || first === "localhost") return first.toLowerCase();
-  return "docker.io";
-}
-
-function isInternalRegistry(reg) {
-  const internal = INTERNAL_REGISTRY.toLowerCase();
-  return reg === internal || reg.startsWith(internal + "/");
-}
-
-// 分级信任模型：档1 内网直通 / 档2 受信白名单留痕 / 档3 未知来源拦截
-// 关键治理原则：用户提交阶段【不允许】直接填写平台内网仓库地址（INTERNAL_REGISTRY）。
-// 内网仓库只应由平台在审批通过后写入（mirror / build）。默认模式下 tier-1 拒绝提交；
-// INTERNAL_ONLY 严格模式用于纯内网环境，此时只接受已在内网仓库的镜像，由管理员预置。
-function classifyRegistry(ref) {
-  const reg = registryOf(ref);
-  if (!ref) return { tier: 3, registry: reg, allowed: false, message: "缺少镜像引用" };
-  if (isInternalRegistry(reg)) {
-    if (INTERNAL_ONLY) {
-      return { tier: 1, registry: reg, allowed: true, message: "内网镜像源，直接通过" };
-    }
-    return {
-      tier: 1,
-      registry: reg,
-      allowed: false,
-      message: "平台内网仓库地址不接受直接提交；请提供外部镜像源（如 ghcr.io/...），审批通过后由平台同步入内网",
-    };
-  }
-  if (!INTERNAL_ONLY) {
-    // 白名单两种粒度：纯域名（ghcr.io）或 域名/命名空间（ghcr.io/stackloklabs）。
-    // 命名空间级白名单须按"完整引用前缀"匹配，只比对 registry 域名会漏判。
-    const full = String(ref).toLowerCase();
-    for (const t of TRUSTED_REGISTRIES) {
-      if (reg === t || full.startsWith(t + "/") || reg.endsWith("." + t)) {
-        return { tier: 2, registry: reg, allowed: true, message: "受信外部源，审批通过后将同步到内网仓库" };
-      }
-    }
-  }
-  return {
-    tier: 3,
-    registry: reg,
-    allowed: false,
-    message: INTERNAL_ONLY
-      ? "严格模式仅允许内网镜像源 " + INTERNAL_REGISTRY
-      : "未知镜像源 " + reg + "：不在受信白名单内，需管理员特批",
-  };
-}
 
 // —— 提交防刷 / 去重配置 ——
 // 同用户 + 同 type + （同名 name 或同 payload_ref）已存在 pending/approved 时拒绝重复提交。
@@ -1099,57 +1043,15 @@ server.on("error", (err) => {
   process.exit(1);
 });
 
-// ---- 启动对账：卡在「扫描中」的提交重新排队 ----
-// 扫描是 fire-and-forget：后端进程在扫描完成前重启/崩溃，异步任务连同超时定时器一起丢失，
-// meta.trivy / meta.prompt_scan 会永远停在 scanning（2026-09-07 flowvision 首条提交即此情况）。
-// 启动后统一检查，把卡在 scanning 的记录重新入队（runSubmissionScans 内部为全局串行队列）。
-function requeueStuckScans() {
-  let n = 0;
-  const rows = db.prepare("SELECT id, type, meta FROM submissions").all();
-  for (const r of rows) {
-    let m;
-    try { m = JSON.parse(r.meta || "{}"); } catch { continue; }
-    const trivyStuck = m.trivy && m.trivy.status === "scanning";
-    const promptStuck = m.prompt_scan && m.prompt_scan.status === "scanning";
-    if (trivyStuck || promptStuck) {
-      runSubmissionScans(r.id, r.type);
-      n++;
-    }
-  }
-  if (n) log.info(`[scan] 启动对账：${n} 条提交卡在扫描中，已重新排队`);
-}
-requeueStuckScans();
+// ---- 启动对账：卡在「扫描中」的提交重新排队（2026-10-15 外迁 lib/requeue-scans.js）----
+require("./lib/requeue-scans").requeueStuckScans(db, log, runSubmissionScans);
 
 // ---- 后台自愈（「健康探测自愈」层）：每 60s 巡检所有 deployed MCP 的固定端口 ingress ----
-// 探测失败 → 重建 socat ingress（端口不变，hash 派生）→ 回写 meta.endpoint。
-// 这样即使无人访问列表页/代理（以前只有被动触发），坏 ingress 也会在 1 分钟内被修好。
-// 单飞锁防重入；巡检逐条串行，避免并发打爆 docker。
-let healing = false;
-
-async function selfHealIngresses() {
-  if (healing) return;
-  healing = true;
-  try {
-    await reconcileMcpWorkloads().catch((e) => log.error("[workload 对账] 异常:", e.message));
-    const now = Date.now();
-    const rows = db.prepare("SELECT id FROM submissions WHERE type='mcp'").all();
-    for (const r of rows) {
-      const st = healFailState.get(r.id);
-      if (st && st.fails >= 3 && now < st.nextTryAt) continue; // 退避中
-      try {
-        const p = await healMcpIngress(r.id);
-        if (p) healFailState.delete(r.id);
-        else {
-          const fails = ((healFailState.get(r.id) || {}).fails || 0) + 1;
-          healFailState.set(r.id, { fails, nextTryAt: now + (fails >= 3 ? HEAL_BACKOFF_MS : 0) });
-        }
-      } catch (_) { /* 单条失败不影响其余 */ }
-    }
-  } finally {
-    healing = false;
-  }
-}
-setInterval(() => { selfHealIngresses().catch(() => {}); }, 60 * 1000).unref();
+// （2026-10-15 自检整改外迁 lib/self-heal.js：探测失败 → 重建 socat ingress → 回写 meta.endpoint）
+const { scheduleSelfHeal } = require("./lib/self-heal").createSelfHeal({
+  db, log, reconcileMcpWorkloads, healMcpIngress, healFailState, HEAL_BACKOFF_MS,
+});
+scheduleSelfHeal();
 
 // ---- 数据库日常维护：每日备份 + 埋点表清理 ----
 // 备份：VACUUM INTO 生成一致性快照（在线安全，不动 WAL），保留最近 14 份。
@@ -1159,37 +1061,11 @@ require("./lib/maintenance").scheduleDailyMaintenance(
   db, log, path.join(__dirname, "backups"), 14,
 );
 
-// ---- 启动恢复：进程被杀可能留下永久卡死的 deploy_status='deploying'（部署轮询随进程一起死）----
-// 重启后按事实对齐：workload 真在跑 → 收敛为 deployed（含固定端口 ingress/endpoint 回写）；
-// workload 不在 → 标记 failed，让管理员用「重新部署」按钮重试（deployMcp 本身幂等可重入）。
-(async () => {
-  try {
-    const stale = db
-      .prepare("SELECT id FROM submissions WHERE type='mcp'")
-      .all()
-      .filter((r) => parseMeta(db.prepare("SELECT meta FROM submissions WHERE id=?").get(r.id)).deploy_status === "deploying");
-    if (!stale.length) return;
-    const list = await thvListJson().catch(() => []);
-    for (const r of stale) {
-      const meta = parseMeta(db.prepare("SELECT meta FROM submissions WHERE id=?").get(r.id));
-      const workload = meta.workload_name || workloadNameFor(r.id);
-      const entry = list.find((x) => x.name === workload);
-      if (entry && entry.status === "running") {
-        await healMcpIngress(r.id).catch(() => {});
-        const now = parseMeta(db.prepare("SELECT meta FROM submissions WHERE id=?").get(r.id));
-        if (now.deploy_status === "deploying") {
-          // 容器在跑但 ingress 收敛失败：至少把状态从 deploying 里解放出来
-          patchMeta(r.id, { deploy_status: "deployed", deploy_error: "" });
-        }
-      } else {
-        patchMeta(r.id, { deploy_status: "failed", deploy_error: "服务重启中断部署，workload 不在运行。请点击「重新部署」重试。" });
-      }
-      log.info("[启动恢复] 处理卡死的部署:", r.id);
-    }
-  } catch (e) {
-    log.error("[启动恢复] 失败:", e.message);
-  }
-})();
+// ---- 启动恢复：进程被杀可能留下永久卡死的 deploy_status='deploying' ----
+// （2026-10-15 自检整改外迁 lib/startup-recovery.js）
+require("./lib/startup-recovery").recoverStaleDeploys({
+  db, log, parseMeta, thvListJson, healMcpIngress, patchMeta, workloadNameFor,
+});
 
 // 优雅退出：先关监听、再关 db，让 SQLite 正常 checkpoint WAL，
 // 避免被 pkill/SIGTERM 强杀时留下"热 WAL"导致下次启动挂起（D 态）。
